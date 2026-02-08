@@ -1,0 +1,37 @@
+[package]
+name = "transxform"
+version = "0.1.0"
+edition = "2021"
+description = "Boundary-governed transformer training supervisor"
+license = "MIT OR Apache-2.0"
+keywords = ["machine-learning", "transformer", "training", "supervisor", "invariant"]
+categories = ["science", "development-tools"]
+
+[features]
+default = []
+tch = ["dep:tch"]
+witness = ["dep:ratatui", "dep:crossterm"]
+merkle = ["dep:sha2"]
+threadsafe = []
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "2"
+log = "0.4"
+
+# Optional ML framework backends
+tch = { version = "0.17", optional = true }
+
+# Optional TUI witness console
+ratatui = { version = "0.29", optional = true }
+crossterm = { version = "0.28", optional = true }
+
+# Optional Merkle hashing
+sha2 = { version = "0.10", optional = true }
+
+[dev-dependencies]
+pretty_assertions = "1"
+tempfile = "3"

@@ -1,0 +1,105 @@
+# LOOM Training Specification (TransXform whitepaper §4)
+#
+# This is a complete training spec for the LOOM recurrent transformer
+# architecture. It demonstrates all TransXform spec features.
+
+model:
+  name: "loom-24L-1024H"
+  layers: 24
+  hidden_dim: 1024
+  attention_heads: 16
+  components:
+    - backbone
+    - compressor
+    - emission_head
+    - attention_head
+    - recurrence_gate
+
+roles:
+  backbone:
+    must_preserve_variance: true
+    must_maintain_gradient: true
+  compressor:
+    output_diversity_required: true
+  emission_head:
+    diversity_required: true
+    must_maintain_gradient: true
+  attention_head:
+    min_active_heads: 12
+  recurrence_gate:
+    must_maintain_gradient: true
+
+invariants:
+  hard:
+    # Per-component gradient norms must stay above floor
+    grad_norm_min:
+      all: 0.0001
+
+    # Cosine similarity ceilings
+    emission_head.pairwise_cosine: 0.95
+    compressor.pairwise_cosine: 0.70
+
+    # Recurrence signal preservation
+    backbone.h0_hfinal_cosine: 0.50
+
+    # Activation variance floor
+    activation_variance_min:
+      all: 0.00001
+
+  soft:
+    # Attention entropy floor
+    attention_entropy_min: 0.3
+
+    # Loss stability
+    loss_explosion_factor: 3.0
+
+    # Gradient spike detection
+    grad_norm_spike_threshold: 100.0
+
+phases:
+  bootstrap:
+    description: "Initial learning — all interventions available"
+    thresholds:
+      # More permissive thresholds during bootstrap
+      emission_head.pairwise_cosine: 0.98
+      compressor.pairwise_cosine: 0.80
+    max_duration_steps: 1000
+    transition_guard:
+      all_hard_invariants_satisfied_for: 200
+
+  representation_formation:
+    description: "Forming stable internal representations"
+    transition_guard:
+      all_hard_invariants_satisfied_for: 500
+
+  stabilization:
+    description: "Tightening invariants, preparing for refinement"
+    thresholds:
+      # Tighter thresholds during stabilization
+      emission_head.pairwise_cosine: 0.90
+    transition_guard:
+      all_hard_invariants_satisfied_for: 300
+
+  refinement:
+    description: "Final convergence — minimal interventions"
+    allowed_interventions:
+      - adjust_lr
+      - freeze
+    transition_guard:
+      all_hard_invariants_satisfied_for: 500
+
+control:
+  cooldown_steps: 50
+  max_hard_interventions: 3
+  hysteresis_margin: 0.05
+  damping_factor: 0.5
+  base_lr: 0.0003
+  regret_window_steps: 200
+
+metric_cadence:
+  tier1: 10
+  tier2: 100
+
+profiles:
+  - name: "loom_base"
+    version: "1.1"
