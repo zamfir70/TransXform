@@ -2,7 +2,7 @@
 
 ## A Spec-Driven Supervisory Architecture That Makes Silent Training Failure Impossible
 
-**Version 1.1 — February 2026**
+**Version 1.2 — February 2026**
 **Authors:** John M. Kuykendall (Acorn KC, LLC), with recursive design contributions from GPT 5.2 and Claude
 **Status:** Architecture Specification
 
@@ -15,6 +15,8 @@ Transformer training is an uncontrolled dynamical system. Practitioners define s
 TransXform eliminates silent training failure by making training closed-loop, stateful, and governed by enforceable invariants. It interposes a supervisory authority between the optimizer and the model, treating gradient updates as *provisional state changes* subject to authoritative post-commit correction. When invariants are violated, the supervisor intervenes with component-local actions — reinitializing frozen submodules, rescaling collapsed representations, dampening gradient spikes — while preserving healthy learned structure elsewhere.
 
 The system borrows its authority model from EDGE (Explicit Delimitation of Generative Epistemics), a boundary-condition cognitive substrate designed for inference-time safety enforcement. TransXform applies the same principle to training: **illegal states cannot persist because they are detected and corrected in real time, not discovered post-hoc.**
+
+A diagnostic layer (§12) supplements hard enforcement with predictive advisory signals — detecting gradient domination, shortcut learning, loss stagnation, overfitting, and intervention futility before they escalate to invariant violations. The diagnostic layer is strictly non-authoritative: it observes and advises, never intervenes.
 
 The result is transformer training that is specifiable, auditable, and recoverable. Failures are localized. Recovery is guaranteed. Progress is explainable. Training stops being alchemy and becomes ordinary engineering.
 
@@ -283,7 +285,7 @@ Thresholds are not free hyperparameters. They are **encoded domain knowledge**. 
 Thresholds are expected to originate from:
 
 - **Prior successful runs:** Metric trajectories from healthy training provide empirical baselines.
-- **Architecture profiles:** Reusable, versioned threshold bundles for common architectures (see §14.2).
+- **Architecture profiles:** Reusable, versioned threshold bundles for common architectures (see §15.2).
 - **Failure signatures:** Each documented failure mode (see §11) implies a detection threshold. These are proven, not guessed.
 - **Theoretical bounds:** Where available (e.g., entropy bounds derived from head count, variance floors derived from hidden dimension).
 
@@ -387,7 +389,7 @@ Interventions are auditable decisions, not assumed to be infallible. The supervi
 - **Post-intervention improvement:** Whether downstream metrics (loss, gradient flow, representation diversity) improve relative to pre-intervention baseline.
 - **Counterfactual signal:** Whether the pre-intervention metric trajectory was trending toward recovery (suggesting the intervention may have been unnecessary).
 
-If post-intervention metrics show no improvement — or the pre-intervention trajectory was already recovering — the intervention is tagged `low_confidence` in the ledger. This does not trigger auto-reversal in v1; the supervisor's authority is unconditional. But the tag feeds offline analysis, threshold tuning, and eventual supervisor policy learning (§14.1).
+If post-intervention metrics show no improvement — or the pre-intervention trajectory was already recovering — the intervention is tagged `low_confidence` in the ledger. This does not trigger auto-reversal in v1; the supervisor's authority is unconditional. But the tag feeds offline analysis, threshold tuning, and eventual supervisor policy learning (§15.1).
 
 **Near-miss tracking.** The supervisor also records **near-misses**: steps where a soft invariant came within the hysteresis margin of a hard threshold but did not cross it. Near-misses are logged with the same metric snapshot as violations, tagged `near_miss`. They are as informative as false positives for threshold calibration — a threshold that is never approached is too loose; a threshold that triggers constant near-misses is too tight. The ledger captures both failure and the shape of almost-failure.
 
@@ -539,7 +541,49 @@ overrides:
 
 ---
 
-## 12. Explicit Non-Goals
+## 12. Diagnostic Layer (V2): Advisory Signals
+
+The V1 supervisor is reactive — it detects invariant violations and intervenes. The V2 diagnostic layer is predictive — it observes metric trends and warns before violations occur. The diagnostic layer is strictly **non-authoritative**: it never intervenes, never blocks phase transitions, and never modifies training state. It observes, and it advises.
+
+### 12.1 Design Principles
+
+- **Advisory only.** Diagnostics produce warnings, not actions. The supervisor's control laws remain the sole authority.
+- **Calm language.** Warnings use "observed," "consistent with," "suggests" — never "detected" or "error."
+- **Deduplication.** Each (signal, component) pair fires once. The user can acknowledge or resolve a warning to allow re-firing.
+- **Phase-aware.** All history and active signals are cleared on phase transition to prevent cross-phase trend contamination.
+- **Configurable.** Warmup period (default 100 steps), cadence (default every 10 steps), history window (default 50 snapshots), and per-signal thresholds are all configurable via `DiagnosticConfig`.
+
+### 12.2 Signal Catalog
+
+| # | Signal | Detects | Validated By |
+|---|--------|---------|--------------|
+| 1 | UnusedCapacity | Component with near-zero variance and/or gradient — not participating in forward pass | — |
+| 2 | MissingStructuralSignal | Cosine and variance not moving — model is not learning structure | — |
+| 3 | LossRepresentationMisalignment | Loss improving but representations stagnating — loss is hiding structural problems | FROG (early) |
+| 4 | DynamicallyUnlearnableRegime | Loss plateau with pathological gradients (vanishing or oscillating) | — |
+| 5 | ShortcutLearning | Variance explosion or collapse while loss improves — model exploiting a shortcut | FROG |
+| 6 | MissingExpectedMetric | Spec declares component metrics that never appear in snapshots | — |
+| 7 | LossStagnation | Loss plateau with healthy gradients — model trying but data signal-to-noise too low | MIRE |
+| 8 | ThresholdDrift | Metric trending monotonically toward a hard threshold — predictive warning | — |
+| 9 | MetricInstability | High coefficient of variation — metric oscillating rather than converging | CRUX |
+| 10 | InterventionFutility | Repeated interventions producing only temporary recovery — structural problem | CRUX |
+| 11 | GradientDomination | One component's gradients overwhelm others — monopolizing the optimizer | CRUX |
+| 12 | MetricAnomaly | NaN or Inf in any metric — numerical corruption sentinel | — |
+| 13 | TrainValDivergence | Training loss decreasing while validation loss increasing — overfitting | — |
+
+### 12.3 Integration with V1
+
+The diagnostic layer runs inside `supervisor.step()`, after the V1 invariant check and control laws. Warnings are recorded in the boundary ledger as `Advisory` entries and summarized in the training certificate and report.
+
+The diagnostic layer receives the same `MetricSnapshot` as the V1 monitor but uses it differently:
+- V1 checks each metric against its threshold independently, at each step.
+- V2 accumulates a history window and detects *patterns* — trends, ratios, oscillation, divergence — that individual-step checks cannot see.
+
+This separation is deliberate. V1 is the law. V2 is the weather forecast.
+
+---
+
+## 13. Explicit Non-Goals
 
 TransXform does NOT:
 
@@ -552,7 +596,7 @@ TransXform does NOT:
 
 ---
 
-## 13. Negative Capability: Refusal to Train
+## 14. Negative Capability: Refusal to Train
 
 TransXform must sometimes refuse to proceed. These are not crashes — they are **verdicts**.
 
@@ -569,37 +613,37 @@ This is philosophically aligned with EDGE and CLIFFORD: **honest refusal beats f
 
 ---
 
-## 14. Future Extensions
+## 15. Future Extensions
 
-These are not required for v1 but are natural consequences of the architecture:
+Some of these extensions have been partially realized in V2 (the diagnostic layer, §12). Others remain future work:
 
-### 14.0 Validation Strategy: LOOM-First
+### 15.0 Validation Strategy: LOOM-First
 
 The v1 implementation is validated against documented LOOM failure modes before generalization. LOOM is the reference architecture — TransXform is the generalization. Every failure signature in §11.1 was discovered during LOOM training; the v1 supervisor must detect and correct each one before the system is applied to other architectures. This ensures that TransXform's invariant catalog, control laws, and phase model are proven against real pathology, not theoretical scenarios.
 
-### 14.1 Supervisor Policy Learning (v2+)
+### 15.1 Supervisor Policy Learning
 
 In v1, policies are static and human-authored. All intervention outcomes are logged with pre-state metrics, action taken, and post-state recovery curves. These logs are structured to support offline analysis and eventual supervised policy updates. Authority must be stable before it can be optimized.
 
-### 14.2 Architecture Profiles (Reusable Spec Packs)
+### 15.2 Architecture Profiles (Reusable Spec Packs)
 
 Named, versioned bundles of invariants + thresholds + phases + control laws for common architectures. Profiles compose: `recurrent_transformer_v1` inherits `base_transformer` and overrides specific invariants. This turns TransXform into a platform with institutional memory.
 
-### 14.3 Cross-Run Memory
+### 15.3 Cross-Run Memory
 
 A failure signature registry that accumulates across runs. Signatures are pattern matches over metric trajectories, advisory (not authoritative). The system gets better without online learning — it accumulates institutional knowledge.
 
-### 14.4 Proof of Training Correctness (Cryptographic)
+### 15.4 Proof of Training Correctness (Cryptographic)
 
 Given full audit logs, emit a cryptographically verifiable certificate attesting that the model never entered illegal states during training. This enables deployment in regulated industries.
 
-### 14.5 Distributed / Multi-Node Training
+### 15.5 Distributed / Multi-Node Training
 
 TransXform runs at the trainer level, not inside the model. Metrics can be reduced across workers; authority decisions are centralized. Simpler than synchronizing optimizers.
 
 ---
 
-## 15. Why This Is Not Overkill
+## 16. Why This Is Not Overkill
 
 ### "Loss already tells us what's going on."
 
@@ -627,7 +671,7 @@ Yes. That's the point. Transformer training is a high-dimensional dynamical syst
 
 ---
 
-## 16. Comparison to Existing Approaches
+## 17. Comparison to Existing Approaches
 
 | Approach | What It Does | What TransXform Adds |
 |---|---|---|
@@ -643,7 +687,7 @@ TransXform is not a replacement for any of these. It is the **authority layer** 
 
 ---
 
-## 17. Implementation Skeleton
+## 18. Implementation Skeleton
 
 ### 17.1 Core Objects
 
@@ -862,7 +906,7 @@ fn main() -> Result<(), TransXformError> {
 
 ---
 
-## 18. Conclusion
+## 19. Conclusion
 
 TransXform doesn't make training smarter. It makes failure illegal.
 
@@ -891,6 +935,10 @@ The core insight is simple: **training is a dynamical system, and dynamical syst
 | **Intervention regret** | Post-hoc assessment of whether an intervention was necessary, based on recovery speed and counterfactual trajectory analysis. |
 | **Near-miss** | A step where a soft invariant approached but did not cross a hard threshold. Logged for threshold calibration. |
 | **Threshold provenance** | The documented origin of a threshold value: prior runs, architecture profiles, failure signatures, or theoretical bounds. |
+| **Diagnostic signal** | An advisory observation about metric trends that may indicate a developing problem. Non-authoritative — never triggers intervention. |
+| **Diagnostic layer** | The V2 subsystem that observes metric history and emits advisory warnings. Runs after V1 invariant checks. |
+| **Readiness gate** | V1.3 mechanism that blocks phase transitions until the model can satisfy the next phase's thresholds. Prevents cliff transitions. |
+| **Checkpoint** | Serialized snapshot of all supervisor runtime state. Enables training resumption with identical governance behavior. |
 
 ## Appendix B: Relationship to EDGE
 
