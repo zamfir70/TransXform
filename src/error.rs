@@ -41,6 +41,9 @@ pub enum TransXformError {
 
     #[error("Metric error: {0}")]
     MetricError(String),
+
+    #[error("Checkpoint error: {0}")]
+    CheckpointError(String),
 }
 
 impl fmt::Display for NegativeVerdict {

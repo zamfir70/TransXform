@@ -31,6 +31,8 @@ pub enum LedgerEntryType {
     Abort,
     /// V2: Advisory diagnostic warning (non-authoritative).
     Advisory,
+    /// V1.3: Runtime threshold amendment (adaptive relaxation).
+    Amendment,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -217,6 +219,33 @@ impl BoundaryLedger {
         });
     }
 
+    /// Record a runtime threshold amendment (V1.3 adaptive relaxation).
+    pub fn record_amendment(
+        &mut self,
+        step: u64,
+        phase: Phase,
+        amendment: &RuntimeAmendment,
+    ) {
+        self.entries.push(LedgerEntry {
+            step,
+            timestamp: Utc::now(),
+            phase,
+            component: "system".into(),
+            invariant: amendment.metric_key.clone(),
+            metric_snapshot: HashMap::new(),
+            action: Action::Abort {
+                reason: format!(
+                    "threshold relaxed: {:.6} → {:.6}",
+                    amendment.original_threshold, amendment.relaxed_threshold,
+                ),
+            },
+            justification: amendment.reason.clone(),
+            outcome: InterventionOutcome::Pending,
+            regret_tag: None,
+            entry_type: LedgerEntryType::Amendment,
+        });
+    }
+
     /// Record a phase transition.
     pub fn record_phase_transition(&mut self, step: u64, transition: &PhaseTransition) {
         self.entries.push(LedgerEntry {
@@ -395,6 +424,24 @@ impl BoundaryLedger {
         }
     }
 
+    /// Extract all state for checkpointing.
+    pub fn save_state(&self) -> crate::checkpoint::LedgerState {
+        crate::checkpoint::LedgerState {
+            entries: self.entries.clone(),
+            start_time: self.start_time,
+            invariant_check_counts: self.invariant_check_counts.clone(),
+            invariant_violation_counts: self.invariant_violation_counts.clone(),
+        }
+    }
+
+    /// Restore state from a checkpoint.
+    pub fn restore_state(&mut self, state: crate::checkpoint::LedgerState) {
+        self.entries = state.entries;
+        self.start_time = state.start_time;
+        self.invariant_check_counts = state.invariant_check_counts;
+        self.invariant_violation_counts = state.invariant_violation_counts;
+    }
+
     /// Serialize the full ledger to JSON.
     pub fn to_json(&self) -> Result<String, TransXformError> {
         Ok(serde_json::to_string_pretty(&self.entries)?)
@@ -450,6 +497,7 @@ mod tests {
             threshold: 0.95,
             direction: ThresholdDirection::Max,
             step: 100,
+            passive: false,
         }
     }
 

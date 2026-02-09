@@ -87,6 +87,12 @@ fn validate_control_config(spec: &TrainingSpec) -> Result<(), TransXformError> {
         ));
     }
 
+    if c.hysteresis_pct < 0.0 || c.hysteresis_pct > 1.0 {
+        return Err(TransXformError::SpecValidation(
+            "hysteresis_pct must be in [0.0, 1.0]".into(),
+        ));
+    }
+
     if c.damping_factor <= 0.0 || c.damping_factor > 1.0 {
         return Err(TransXformError::SpecValidation(
             "damping_factor must be in (0.0, 1.0]".into(),

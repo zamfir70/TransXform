@@ -390,3 +390,157 @@ fn loom_spec_parses_successfully() {
     assert_eq!(spec.control.cooldown_steps, 50);
     assert_eq!(spec.control.max_hard_interventions, 3);
 }
+
+// =========================================================================
+// Scenario 12: Checkpoint and resume produces identical behavior
+// =========================================================================
+
+#[test]
+fn checkpoint_resume_produces_identical_behavior() {
+    let spec_yaml = default_spec();
+    let (mut supervisor, model) = make_supervisor(spec_yaml, &["backbone", "head"]);
+
+    // Start with a violation to create some state
+    {
+        let mut m = model.borrow_mut();
+        m.set_metric("head", "pairwise_cosine", 0.99);
+        m.set_metric("head", "grad_norm", 0.0005);
+        m.set_metric("backbone", "grad_norm", 0.05);
+        m.set_global_metric("loss", 2.0);
+    }
+    supervisor.step(0).unwrap();
+
+    // Recover and run a few more steps
+    set_healthy_metrics(&model);
+    for step in 1..15 {
+        supervisor.step(step).unwrap();
+    }
+
+    // Checkpoint at step 15
+    let checkpoint = supervisor.checkpoint(15);
+    assert_eq!(checkpoint.step, 15);
+    assert_eq!(checkpoint.model_name, "test-model");
+    assert!(checkpoint.total_interventions > 0);
+
+    // Continue original to step 20
+    for step in 15..20 {
+        supervisor.step(step).unwrap();
+    }
+    let original_phase = supervisor.current_phase();
+    let original_interventions = supervisor.total_interventions();
+
+    // Restore from checkpoint at step 15
+    let spec = parse_spec(spec_yaml).unwrap();
+    let model2 = Rc::new(RefCell::new(MockModel::new(&["backbone", "head"])));
+    {
+        let mut m = model2.borrow_mut();
+        m.set_metric("head", "pairwise_cosine", 0.5);
+        m.set_metric("head", "grad_norm", 0.0005);
+        m.set_metric("backbone", "grad_norm", 0.05);
+        m.set_metric("backbone", "activation_variance", 0.01);
+        m.set_global_metric("loss", 2.0);
+    }
+    let collector2 = transxform::collector::BasicMetricCollector::new(
+        vec!["backbone".into(), "head".into()],
+        HashMap::new(),
+    );
+    let mut restored = Supervisor::from_checkpoint(spec, model2, collector2, checkpoint).unwrap();
+
+    // Run restored from step 15 to step 20 with same metrics
+    for step in 15..20 {
+        restored.step(step).unwrap();
+    }
+
+    // Both should be in the same phase with same intervention count
+    assert_eq!(restored.current_phase(), original_phase);
+    assert_eq!(restored.total_interventions(), original_interventions);
+}
+
+// =========================================================================
+// Scenario 13: Checkpoint JSON serialization roundtrip
+// =========================================================================
+
+#[test]
+fn checkpoint_json_roundtrip() {
+    let (mut supervisor, model) = make_supervisor(default_spec(), &["backbone", "head"]);
+    set_healthy_metrics(&model);
+
+    for step in 0..10 {
+        supervisor.step(step).unwrap();
+    }
+
+    let checkpoint = supervisor.checkpoint(10);
+    let json = checkpoint.to_json().unwrap();
+    let restored = SupervisorCheckpoint::from_json(&json).unwrap();
+
+    assert_eq!(restored.step, 10);
+    assert_eq!(restored.model_name, "test-model");
+    assert_eq!(restored.phase_controller.current, supervisor.current_phase());
+}
+
+// =========================================================================
+// Scenario 14: Checkpoint model name mismatch rejected
+// =========================================================================
+
+#[test]
+fn checkpoint_rejects_model_name_mismatch() {
+    let (mut supervisor, model) = make_supervisor(default_spec(), &["backbone", "head"]);
+    set_healthy_metrics(&model);
+    supervisor.step(0).unwrap();
+
+    let checkpoint = supervisor.checkpoint(1);
+
+    // Try to restore with a different spec (different model name)
+    let different_spec = parse_spec(r#"
+model:
+  name: "different-model"
+  components: [backbone, head]
+invariants:
+  hard:
+    head.pairwise_cosine: 0.95
+  soft: {}
+phases: {}
+control: {}
+"#).unwrap();
+
+    let model2 = Rc::new(RefCell::new(MockModel::new(&["backbone", "head"])));
+    let collector2 = transxform::collector::BasicMetricCollector::new(
+        vec!["backbone".into(), "head".into()],
+        HashMap::new(),
+    );
+
+    let result = Supervisor::from_checkpoint(different_spec, model2, collector2, checkpoint);
+    match result {
+        Err(e) => {
+            let msg = e.to_string();
+            assert!(msg.contains("does not match"), "Expected model name mismatch error, got: {}", msg);
+        }
+        Ok(_) => panic!("Expected error for model name mismatch"),
+    }
+}
+
+// =========================================================================
+// Scenario 15: Checkpoint hint fires near phase transition
+// =========================================================================
+
+#[test]
+fn checkpoint_hint_fires_on_phase_transition() {
+    let (mut supervisor, model) = make_supervisor(default_spec(), &["backbone", "head"]);
+    set_healthy_metrics(&model);
+
+    let mut got_hint = false;
+    for step in 0..10 {
+        let report = supervisor.step(step).unwrap();
+        if let Some(hint) = &report.checkpoint_hint {
+            got_hint = true;
+            // Should be either pre or post transition
+            match &hint.reason {
+                CheckpointReason::PrePhaseTransition { .. } => {},
+                CheckpointReason::PostPhaseTransition { .. } => {},
+                _ => panic!("Unexpected checkpoint reason: {:?}", hint.reason),
+            }
+        }
+    }
+
+    assert!(got_hint, "Should have received at least one checkpoint hint near phase transition");
+}

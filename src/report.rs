@@ -529,6 +529,7 @@ mod tests {
             threshold: 0.95,
             direction: ThresholdDirection::Max,
             step: 100,
+            passive: false,
         };
         let action = Action::Reinitialize {
             component: "head".into(),

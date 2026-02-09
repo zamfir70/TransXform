@@ -3,6 +3,7 @@ pub mod model;
 pub mod spec;
 pub mod types;
 
+pub mod checkpoint;
 pub mod collector;
 pub mod control;
 pub mod diagnostic;
@@ -38,6 +39,7 @@ pub use registry::SignatureRegistry;
 pub use regret::RegretTracker;
 pub use supervisor::Supervisor;
 
+pub use checkpoint::{CheckpointHint, CheckpointReason, SupervisorCheckpoint};
 pub use diagnostic::{DiagnosticConfig, DiagnosticLayer};
 pub use merkle::MerkleState;
 pub use report::{generate_report, generate_report_with_diagnostics};

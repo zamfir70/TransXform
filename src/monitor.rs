@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::spec::{InvariantBlock, InvariantValue, TrainingSpec};
+use crate::spec::{ControlConfig, InvariantBlock, InvariantValue, TrainingSpec};
 use crate::types::*;
 
 /// An invariant resolved from the spec into a flat, evaluable form.
@@ -37,34 +37,74 @@ impl InvariantMonitor {
         &self.invariants
     }
 
+    /// Get all unique metric keys that invariants depend on.
+    /// Used by the diagnostic layer to detect missing metrics.
+    pub fn metric_keys(&self) -> Vec<String> {
+        let mut keys: Vec<String> = self
+            .invariants
+            .iter()
+            .map(|i| i.metric_key.clone())
+            .collect();
+        keys.sort();
+        keys.dedup();
+        keys
+    }
+
     /// Check all invariants against the given metrics for the current phase.
     ///
     /// `phase_thresholds` override `base_threshold` for matching invariant names.
-    /// `hysteresis_margin` prevents triggering on boundary touches.
+    /// Hysteresis is proportional: `max(threshold * pct, floor)`.
+    /// Catastrophic overrides bypass both phase thresholds and hysteresis.
     pub fn check(
         &self,
         metrics: &MetricSnapshot,
         phase_thresholds: &HashMap<String, f64>,
-        hysteresis_margin: f64,
+        control: &ControlConfig,
         step: u64,
     ) -> Vec<Violation> {
         let mut violations = Vec::new();
 
         for inv in &self.invariants {
+            let observed = match metrics.get(&inv.metric_key) {
+                Some(v) => *v,
+                None => continue, // Metric not reported this step — skip
+            };
+
+            // 1. Check catastrophic overrides first (zero hysteresis, ignores phase)
+            let catastrophic = control.catastrophic_overrides.get(&inv.metric_key)
+                .or_else(|| control.catastrophic_overrides.get(&inv.name));
+            if let Some(&cat_threshold) = catastrophic {
+                let cat_violated = match inv.direction {
+                    ThresholdDirection::Min => observed < cat_threshold,
+                    ThresholdDirection::Max => observed > cat_threshold,
+                };
+                if cat_violated {
+                    violations.push(Violation {
+                        invariant_name: inv.name.clone(),
+                        component: inv.component.clone(),
+                        severity: inv.severity,
+                        observed,
+                        threshold: cat_threshold,
+                        direction: inv.direction,
+                        step,
+                        passive: false,
+                    });
+                    continue; // Don't double-count
+                }
+            }
+
+            // 2. Normal check with phase thresholds + proportional hysteresis
             let threshold = phase_thresholds
                 .get(&inv.metric_key)
                 .or_else(|| phase_thresholds.get(&inv.name))
                 .copied()
                 .unwrap_or(inv.base_threshold);
 
-            let observed = match metrics.get(&inv.metric_key) {
-                Some(v) => *v,
-                None => continue, // Metric not reported this step — skip
-            };
+            let margin = control.effective_margin(threshold);
 
             let violated = match inv.direction {
-                ThresholdDirection::Min => observed < threshold - hysteresis_margin,
-                ThresholdDirection::Max => observed > threshold + hysteresis_margin,
+                ThresholdDirection::Min => observed < threshold - margin,
+                ThresholdDirection::Max => observed > threshold + margin,
             };
 
             if violated {
@@ -76,6 +116,7 @@ impl InvariantMonitor {
                     threshold,
                     direction: inv.direction,
                     step,
+                    passive: false,
                 });
             }
         }
@@ -84,12 +125,12 @@ impl InvariantMonitor {
     }
 
     /// Check for near-misses: metrics within hysteresis margin of a hard threshold
-    /// but not yet violating it.
+    /// but not yet violating it. Uses proportional hysteresis per-threshold.
     pub fn check_near_misses(
         &self,
         metrics: &MetricSnapshot,
         phase_thresholds: &HashMap<String, f64>,
-        hysteresis_margin: f64,
+        control: &ControlConfig,
         step: u64,
     ) -> Vec<NearMiss> {
         let mut near_misses = Vec::new();
@@ -122,20 +163,21 @@ impl InvariantMonitor {
 
             // Is there a hard threshold on the same metric?
             if let Some(&(hard_thresh, direction)) = hard_thresholds.get(inv.metric_key.as_str()) {
-                let margin = match direction {
+                let hyst_margin = control.effective_margin(hard_thresh);
+                let distance = match direction {
                     ThresholdDirection::Min => hard_thresh - observed,
                     ThresholdDirection::Max => observed - hard_thresh,
                 };
 
                 // Near-miss: within hysteresis margin but not actually violating
-                if margin > -hysteresis_margin && margin < hysteresis_margin {
+                if distance > -hyst_margin && distance < hyst_margin {
                     near_misses.push(NearMiss {
                         step,
                         invariant_name: inv.name.clone(),
                         component: inv.component.clone(),
                         observed,
                         hard_threshold: hard_thresh,
-                        margin: margin.abs(),
+                        margin: distance.abs(),
                         metric_snapshot: metrics.clone(),
                     });
                 }
@@ -308,6 +350,23 @@ control: {}
         .unwrap()
     }
 
+    /// Build a ControlConfig with zero hysteresis (flat, backward-compatible).
+    fn zero_control() -> ControlConfig {
+        ControlConfig {
+            cooldown_steps: 50,
+            max_hard_interventions: 3,
+            hysteresis_margin: 0.0,
+            hysteresis_pct: 0.0,
+            catastrophic_overrides: HashMap::new(),
+            damping_factor: 0.5,
+            base_lr: None,
+            regret_window_steps: 100,
+            readiness_gate: true,
+            readiness_patience_steps: 200,
+            max_threshold_relaxation: 0.02,
+        }
+    }
+
     #[test]
     fn resolves_invariants() {
         let spec = test_spec();
@@ -325,7 +384,7 @@ control: {}
         metrics.insert("head.pairwise_cosine".into(), 0.99); // above 0.95 threshold
         metrics.insert("head.grad_norm".into(), 0.0005); // below 0.001 threshold, no violation
 
-        let violations = monitor.check(&metrics, &HashMap::new(), 0.0, 100);
+        let violations = monitor.check(&metrics, &HashMap::new(), &zero_control(), 100);
         assert_eq!(violations.len(), 1);
         assert_eq!(violations[0].invariant_name, "head.pairwise_cosine");
         assert_eq!(violations[0].severity, Severity::Hard);
@@ -340,9 +399,112 @@ control: {}
         // Exactly at threshold + small amount less than hysteresis
         metrics.insert("head.pairwise_cosine".into(), 0.97);
 
-        // With 0.05 hysteresis, need > 0.95 + 0.05 = 1.0 to trigger
-        let violations = monitor.check(&metrics, &HashMap::new(), 0.05, 100);
+        // With flat 0.05 hysteresis, need > 0.95 + 0.05 = 1.0 to trigger
+        let ctrl = ControlConfig {
+            hysteresis_margin: 0.05,
+            ..zero_control()
+        };
+        let violations = monitor.check(&metrics, &HashMap::new(), &ctrl, 100);
         assert!(violations.is_empty());
+    }
+
+    #[test]
+    fn proportional_hysteresis_scales_with_threshold() {
+        let spec = test_spec();
+        let monitor = InvariantMonitor::new(&spec);
+
+        let mut metrics = MetricSnapshot::new();
+        // Threshold = 0.95, pct = 0.10 → margin = 0.095
+        // observed = 1.04 → 1.04 > 0.95 + 0.095 = 1.045? No → no violation
+        metrics.insert("head.pairwise_cosine".into(), 1.04);
+
+        let ctrl = ControlConfig {
+            hysteresis_margin: 0.001, // floor
+            hysteresis_pct: 0.10,     // 10% of threshold
+            ..zero_control()
+        };
+        let violations = monitor.check(&metrics, &HashMap::new(), &ctrl, 100);
+        assert!(violations.is_empty());
+
+        // observed = 1.05 → 1.05 > 1.045 → violation
+        metrics.insert("head.pairwise_cosine".into(), 1.05);
+        let violations = monitor.check(&metrics, &HashMap::new(), &ctrl, 100);
+        assert_eq!(violations.len(), 1);
+    }
+
+    #[test]
+    fn proportional_hysteresis_respects_floor() {
+        let spec = test_spec();
+        let monitor = InvariantMonitor::new(&spec);
+
+        // For grad_norm threshold 0.001, pct = 0.10 → 0.0001, but floor = 0.001
+        // So margin = max(0.0001, 0.001) = 0.001
+        // Min direction: observed < 0.001 - 0.001 = 0.0 to violate
+        let mut metrics = MetricSnapshot::new();
+        metrics.insert("head.grad_norm".into(), 0.0001); // above 0.0, no violation
+
+        let ctrl = ControlConfig {
+            hysteresis_margin: 0.001,
+            hysteresis_pct: 0.10,
+            ..zero_control()
+        };
+        // grad_norm is Max direction (default), threshold 0.001
+        // observed 0.0001 < 0.001 + 0.001 = 0.002 → no violation
+        let violations = monitor.check(&metrics, &HashMap::new(), &ctrl, 100);
+        let grad_violations: Vec<_> = violations.iter()
+            .filter(|v| v.invariant_name == "head.grad_norm")
+            .collect();
+        assert!(grad_violations.is_empty());
+    }
+
+    #[test]
+    fn catastrophic_override_fires_regardless() {
+        let spec = test_spec();
+        let monitor = InvariantMonitor::new(&spec);
+
+        let mut metrics = MetricSnapshot::new();
+        // Cosine at 0.998 — above catastrophic ceiling of 0.995
+        metrics.insert("head.pairwise_cosine".into(), 0.998);
+
+        let mut cat = HashMap::new();
+        cat.insert("head.pairwise_cosine".to_string(), 0.995);
+
+        let ctrl = ControlConfig {
+            hysteresis_margin: 100.0, // absurdly large — would mask everything
+            hysteresis_pct: 0.0,
+            catastrophic_overrides: cat,
+            ..zero_control()
+        };
+
+        // Even with huge hysteresis, catastrophic fires (zero hysteresis)
+        let violations = monitor.check(&metrics, &HashMap::new(), &ctrl, 100);
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0].threshold, 0.995);
+    }
+
+    #[test]
+    fn catastrophic_override_by_invariant_name() {
+        let spec = test_spec();
+        let monitor = InvariantMonitor::new(&spec);
+
+        // activation_variance_min has metric_key "backbone.activation_variance_min"
+        // but we can also match by invariant name "activation_variance_min"
+        let mut metrics = MetricSnapshot::new();
+        metrics.insert("backbone.activation_variance_min".into(), 0.000001);
+
+        let mut cat = HashMap::new();
+        cat.insert("activation_variance_min".to_string(), 0.00001); // Min direction
+
+        let ctrl = ControlConfig {
+            catastrophic_overrides: cat,
+            ..zero_control()
+        };
+
+        let violations = monitor.check(&metrics, &HashMap::new(), &ctrl, 100);
+        let var_violations: Vec<_> = violations.iter()
+            .filter(|v| v.invariant_name == "activation_variance_min")
+            .collect();
+        assert!(!var_violations.is_empty());
     }
 
     #[test]
@@ -358,7 +520,7 @@ control: {}
         let mut overrides = HashMap::new();
         overrides.insert("head.pairwise_cosine".into(), 0.90);
 
-        let violations = monitor.check(&metrics, &overrides, 0.0, 100);
+        let violations = monitor.check(&metrics, &overrides, &zero_control(), 100);
         assert_eq!(violations.len(), 1);
     }
 
@@ -368,7 +530,7 @@ control: {}
         let monitor = InvariantMonitor::new(&spec);
 
         let metrics = MetricSnapshot::new(); // empty
-        let violations = monitor.check(&metrics, &HashMap::new(), 0.0, 100);
+        let violations = monitor.check(&metrics, &HashMap::new(), &zero_control(), 100);
         assert!(violations.is_empty());
     }
 

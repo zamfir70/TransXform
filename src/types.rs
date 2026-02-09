@@ -70,6 +70,21 @@ impl Phase {
     }
 }
 
+impl std::str::FromStr for Phase {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "bootstrap" => Ok(Phase::Bootstrap),
+            "representation_formation" => Ok(Phase::RepresentationFormation),
+            "stabilization" => Ok(Phase::Stabilization),
+            "refinement" => Ok(Phase::Refinement),
+            "aborted" => Ok(Phase::Aborted),
+            _ => Err(format!("Unknown phase: {}", s)),
+        }
+    }
+}
+
 impl fmt::Display for Phase {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -125,7 +140,7 @@ pub enum MetricTier {
 // ---------------------------------------------------------------------------
 
 /// A detected invariant violation.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Violation {
     pub invariant_name: String,
     pub component: String,
@@ -134,15 +149,20 @@ pub struct Violation {
     pub threshold: f64,
     pub direction: ThresholdDirection,
     pub step: u64,
+    /// Passive violations are observed but not acted on.
+    /// Set by the supervisor based on the component's role declaration.
+    #[serde(default)]
+    pub passive: bool,
 }
 
 impl fmt::Display for Violation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let tag = if self.passive { " (passive)" } else { "" };
         write!(
             f,
-            "[{}] {}.{}: observed={:.6}, threshold={:.6} ({})",
+            "[{}] {}.{}: observed={:.6}, threshold={:.6} ({}){}",
             self.severity, self.component, self.invariant_name, self.observed,
-            self.threshold, self.direction,
+            self.threshold, self.direction, tag,
         )
     }
 }
@@ -277,7 +297,7 @@ pub enum RegretTag {
 // ---------------------------------------------------------------------------
 
 /// Near-miss record (whitepaper §6.4).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NearMiss {
     pub step: u64,
     pub invariant_name: String,
@@ -286,6 +306,37 @@ pub struct NearMiss {
     pub hard_threshold: f64,
     pub margin: f64,
     pub metric_snapshot: MetricSnapshot,
+}
+
+// ---------------------------------------------------------------------------
+// RuntimeAmendment
+// ---------------------------------------------------------------------------
+
+/// A runtime threshold amendment — applied when the supervisor determines
+/// that a spec threshold is unachievable and bounded relaxation is needed
+/// to prevent stuck training.
+///
+/// Amendments are logged in the boundary ledger, appear in the training
+/// certificate, and use calm language: "relaxed," "adapted," "within bounds."
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeAmendment {
+    pub step: u64,
+    pub metric_key: String,
+    pub phase: Phase,
+    pub original_threshold: f64,
+    pub relaxed_threshold: f64,
+    pub reason: String,
+}
+
+impl fmt::Display for RuntimeAmendment {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "step {}: {}.{} relaxed {:.6} → {:.6} ({})",
+            self.step, self.phase, self.metric_key,
+            self.original_threshold, self.relaxed_threshold, self.reason,
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -315,7 +366,7 @@ impl fmt::Display for PhaseTransition {
 // DiagnosticSignal (V2 — advisory layer)
 // ---------------------------------------------------------------------------
 
-/// The five epistemic early-warning signals (V2 diagnostic layer).
+/// The thirteen epistemic early-warning signals (V2 diagnostic layer).
 ///
 /// These are advisory-only — they surface evidence of potential problems
 /// but make no claims of correctness and perform no interventions.
@@ -337,6 +388,36 @@ pub enum DiagnosticSignal {
     /// High task performance but representation rank collapses; model ignores
     /// input structure, exploits surface statistics.
     ShortcutLearning,
+    /// Loss has not improved meaningfully for an extended period despite
+    /// healthy gradient flow. The model is trying but making no progress —
+    /// possible causes include noisy data, capacity mismatch, or a flat
+    /// loss basin.
+    LossStagnation,
+    /// An invariant's expected metric key has never appeared in any metric
+    /// snapshot. The invariant is silently inactive — a configuration or
+    /// integration error between the spec and the training loop.
+    MissingExpectedMetric,
+    /// A metric is trending monotonically toward its invariant threshold.
+    /// Early detection enables preemptive advisory before reactive intervention.
+    ThresholdDrift,
+    /// A metric exhibits high-frequency oscillation (high coefficient of
+    /// variation) indicating training instability even when the metric never
+    /// crosses its invariant threshold.
+    MetricInstability,
+    /// Repeated interventions on the same component fail to improve the
+    /// metric. The supervisor keeps trying, but the architecture or data
+    /// may be the root cause.
+    InterventionFutility,
+    /// One component's gradient norms are orders of magnitude larger than
+    /// others, monopolizing optimizer updates. Suppressed components may
+    /// not receive meaningful parameter updates.
+    GradientDomination,
+    /// A metric value is NaN or infinite — numerical corruption that will
+    /// propagate through all downstream computations.
+    MetricAnomaly,
+    /// Training loss is decreasing while validation loss is increasing.
+    /// This divergence pattern is consistent with overfitting.
+    TrainValDivergence,
 }
 
 impl fmt::Display for DiagnosticSignal {
@@ -351,6 +432,14 @@ impl fmt::Display for DiagnosticSignal {
                 write!(f, "dynamically_unlearnable_regime")
             }
             DiagnosticSignal::ShortcutLearning => write!(f, "shortcut_learning"),
+            DiagnosticSignal::LossStagnation => write!(f, "loss_stagnation"),
+            DiagnosticSignal::MissingExpectedMetric => write!(f, "missing_expected_metric"),
+            DiagnosticSignal::ThresholdDrift => write!(f, "threshold_drift"),
+            DiagnosticSignal::MetricInstability => write!(f, "metric_instability"),
+            DiagnosticSignal::InterventionFutility => write!(f, "intervention_futility"),
+            DiagnosticSignal::GradientDomination => write!(f, "gradient_domination"),
+            DiagnosticSignal::MetricAnomaly => write!(f, "metric_anomaly"),
+            DiagnosticSignal::TrainValDivergence => write!(f, "train_val_divergence"),
         }
     }
 }
@@ -359,7 +448,7 @@ impl fmt::Display for DiagnosticSignal {
 ///
 /// Language is deliberately calm and precise: "observed," "consistent with,"
 /// "suggests," "unlikely under." No drama. No claims of correctness.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiagnosticWarning {
     pub signal: DiagnosticSignal,
     pub step: u64,

@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::types::*;
 
@@ -12,7 +12,7 @@ pub struct RegretTracker {
 }
 
 /// An open regret window for a specific intervention.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegretWindow {
     pub intervention_step: u64,
     pub component: String,
@@ -26,7 +26,7 @@ pub struct RegretWindow {
 }
 
 /// The outcome of a regret window evaluation.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegretAssessment {
     pub intervention_step: u64,
     pub component: String,
@@ -118,6 +118,22 @@ impl RegretTracker {
     /// Get all near-misses.
     pub fn near_misses(&self) -> &[NearMiss] {
         &self.near_misses
+    }
+
+    /// Extract state for checkpointing.
+    pub fn save_state(&self) -> crate::checkpoint::RegretTrackerState {
+        crate::checkpoint::RegretTrackerState {
+            windows: self.windows.clone(),
+            near_misses: self.near_misses.clone(),
+            regret_window_length: self.regret_window_length,
+        }
+    }
+
+    /// Restore state from a checkpoint.
+    pub fn restore_state(&mut self, state: crate::checkpoint::RegretTrackerState) {
+        self.windows = state.windows;
+        self.near_misses = state.near_misses;
+        self.regret_window_length = state.regret_window_length;
     }
 
     /// Get all open (pending) windows.

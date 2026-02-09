@@ -26,7 +26,7 @@ log = "0.4"
 tch = { version = "0.17", optional = true }
 
 # Optional TUI witness console
-ratatui = { version = "0.29", optional = true }
+ratatui = { version = "0.30", optional = true }
 crossterm = { version = "0.28", optional = true }
 
 # Optional Merkle hashing

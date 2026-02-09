@@ -129,6 +129,17 @@ control:
                     );
                 }
 
+                // V1.4: Checkpoint hint
+                if let Some(ref hint) = report.checkpoint_hint {
+                    println!(
+                        "Step {:4}: Checkpoint hint: {:?}",
+                        step, hint.reason,
+                    );
+                    // In a real training loop, you'd save here:
+                    // let checkpoint = supervisor.checkpoint(step);
+                    // checkpoint.save_json(Path::new("checkpoint.json")).unwrap();
+                }
+
                 if !report.signature_matches.is_empty() {
                     println!(
                         "Step {:4}: Signature matches: {:?}",

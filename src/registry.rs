@@ -101,6 +101,24 @@ impl SignatureRegistry {
             .collect()
     }
 
+    /// Extract match state for checkpointing.
+    /// Signatures themselves are rebuilt from defaults; only match counters are saved.
+    pub fn save_state(&self) -> crate::checkpoint::RegistryState {
+        crate::checkpoint::RegistryState {
+            match_state: self.match_state.clone(),
+        }
+    }
+
+    /// Restore match state from a checkpoint.
+    /// Only restores counters for signatures that still exist in the registry.
+    pub fn restore_state(&mut self, state: crate::checkpoint::RegistryState) {
+        for (id, count) in state.match_state {
+            if self.match_state.contains_key(&id) {
+                self.match_state.insert(id, count);
+            }
+        }
+    }
+
     /// Get a signature by ID.
     pub fn get(&self, id: &str) -> Option<&FailureSignature> {
         self.signatures.iter().find(|s| s.id == id)

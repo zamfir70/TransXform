@@ -7,13 +7,9 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use ratatui::{
-    prelude::*,
-    widgets::{Block, Borders, Paragraph},
-};
+use ratatui::prelude::*;
 
 use crate::supervisor::SupervisorReport;
-use crate::types::Phase;
 
 use super::markers::render_markers;
 use super::phase_strip::render_phase_strip;
