@@ -906,13 +906,56 @@ fn main() -> Result<(), TransXformError> {
 
 ---
 
-## 19. Conclusion
+## 19. Training Integrity: Why Correction Is Not Prevention
 
-TransXform doesn't make training smarter. It makes failure illegal.
+### 19.1 Late Correction Is Structural Injury
 
-By enforcing invariants, modeling phases, and granting authority to a supervisor instead of loss curves, it becomes structurally impossible for a model to fail silently. Training stops being an art practiced by the lucky few and becomes ordinary engineering practiced by anyone who can write a spec.
+Every intervention — every reinit, every LR halving, every forced rescale — changes the internal geometry of the model. The optimizer may recover loss, but the optimization trajectory has been permanently altered. The model lands in a different basin. It generalizes differently. It behaves differently under distribution shift.
 
-The core insight is simple: **training is a dynamical system, and dynamical systems without feedback control are not engineered systems — they are experiments.** TransXform adds the feedback control. Everything else follows.
+This is not speculation. Recent work on training dynamics establishes that:
+
+- **Training stability is a system property, not a loss artifact.** Small perturbations to optimization state can induce abrupt, irreversible collapse, and stability is a distinct dimension from final performance (Zhang et al., 2026).
+- **Gradient and loss spikes disrupt the learning process.** Large spikes destabilize optimization and commonly force manual restarts (Huang et al., 2025 — SPAM).
+- **Reinitialization changes the solution geometry.** Reinitializing subsets of parameters during training biases convergence toward different minima with different generalization properties (Alabdulmohsin et al., 2021; Zaidi et al., 2023).
+- **The training path matters, not just the endpoint.** Techniques like Stochastic Weight Averaging demonstrate that trajectory shape affects the width and quality of the final optimum (Foret et al., 2020 — SAM).
+
+The implication is clear: **a model that required intervention is not the same as a model that never needed it.** Even when the intervention "works" — loss recovers, metrics return to healthy ranges — the model carries a scar. The optimizer remembers the trauma even if the dashboard forgets it.
+
+### 19.2 The Trichotomy
+
+TransXform produces three verdicts, and they are not equal:
+
+| Verdict | Meaning | What It Says About the Model |
+|---------|---------|------|
+| **CLEAN** | Zero interventions throughout training | The model was never injured. The governance prevented illegal states through timing alone. |
+| **RECOVERED** | Interventions were required but succeeded | The model was injured and healed. The scar is acknowledged in the boundary ledger. |
+| **ABORTED** | Interventions exhausted without recovery | The architecture is structurally broken. Honest refusal beats false success. |
+
+This trichotomy matters enormously once you care about long-horizon behavior, stability under distribution shift, interpretability, downstream fine-tuning, or safety guarantees that aren't vibes-based.
+
+A CLEAN verdict means the readiness gate held the model until it was ready, the phase transitions happened at the right time, and the thresholds were never crossed. No reinit. No LR cascade. No forced correction. The model learned on its own schedule, within its declared boundaries.
+
+That distinction — between RECOVERED and CLEAN — is the reason TransXform becomes a precondition rather than an add-on. Like memory safety, determinism, reproducibility, and audit logs: not optional, not a feature, a requirement.
+
+### 19.3 From Supervision to Integrity
+
+**TransXform is not a system for fixing broken training runs. It is a system for ensuring that training never breaks in the first place.**
+
+The diagnostic layer (§12) predicts problems before they become violations. The readiness gate prevents premature phase transitions. The phase model applies the right thresholds at the right time. The V1 control laws are the last line of defense — and the goal is for them to never fire.
+
+This reframes what TransXform is. It is not training supervision. It is **training integrity** — the structural guarantee that the optimization trajectory was never perturbed, the representations were never corrupted, and the model was never forced to recover from something that should not have happened.
+
+---
+
+## 20. Conclusion
+
+TransXform doesn't make training smarter. It makes failure illegal — and prevention preferable to cure.
+
+By enforcing invariants, modeling phases, predicting violations, and granting authority to a supervisor instead of loss curves, it becomes structurally impossible for a model to fail silently. Training stops being an art practiced by the lucky few and becomes ordinary engineering practiced by anyone who can write a spec.
+
+The core insight is simple: **training is a dynamical system, and dynamical systems without feedback control are not engineered systems — they are experiments.** TransXform adds the feedback control. The diagnostic layer adds the weather forecast. The readiness gate adds the timing. Everything else follows.
+
+A model trained under TransXform with a CLEAN verdict isn't just successful. It's unscarred.
 
 ---
 
@@ -939,6 +982,8 @@ The core insight is simple: **training is a dynamical system, and dynamical syst
 | **Diagnostic layer** | The V2 subsystem that observes metric history and emits advisory warnings. Runs after V1 invariant checks. |
 | **Readiness gate** | V1.3 mechanism that blocks phase transitions until the model can satisfy the next phase's thresholds. Prevents cliff transitions. |
 | **Checkpoint** | Serialized snapshot of all supervisor runtime state. Enables training resumption with identical governance behavior. |
+| **Training integrity** | The structural guarantee that the optimization trajectory was never perturbed by forced corrections. A CLEAN verdict attests to training integrity. |
+| **Structural injury** | The lasting geometric change to a model's parameter space caused by a forced intervention (reinit, LR cascade, rescale). Recoverable in loss, not in trajectory. |
 
 ## Appendix B: Relationship to EDGE
 
@@ -957,3 +1002,19 @@ TransXform borrows its authority model directly from EDGE (Explicit Delimitation
 | Boundary hardening (learning) | Failure signature accumulation |
 
 The philosophical alignment is exact: EDGE says "no reasoning step may commit without boundary approval." TransXform says "no gradient step may persist without invariant approval." Same principle — authority over state transitions — applied at different phases of the system lifecycle.
+
+## Appendix C: References
+
+The following works support the claim in §19 that mid-training corrections alter model geometry in lasting, non-neutral ways:
+
+1. Zhang, Z. et al., "Training instability in deep learning follows low-dimensional dynamical principles," 2026. Establishes that training stability is a system property distinct from final performance, and that small perturbations to optimization state can induce abrupt, irreversible collapse.
+
+2. Huang, T. et al., "SPAM: Spike-Aware Adam with Momentum Reset for Stable LLM Training," 2025. Documents that gradient and loss spikes during large model training destabilize optimization and commonly force manual restarts, motivating spike-aware optimizers.
+
+3. Alabdulmohsin, I. et al., "The Impact of Reinitialization on Generalization in Convolutional Neural Networks," 2021. Evidence that reinitializing subsets of parameters during training biases convergence toward different minima with different generalization properties.
+
+4. Zaidi, S. et al., "When Does Re-initialization Work?," 2023. Empirical study showing that periodic reinitialization interacts with hyperparameters in complex ways and is not a neutral operation — corrective resets materially alter training behavior.
+
+5. Plusch, G. et al., "The Weights Reset Technique for Deep Neural Networks," 2023. Broader framework for understanding how weight modifications during training change generalization behavior.
+
+6. Foret, P. et al., "Sharpness-Aware Minimization (SAM) for Efficiently Improving Generalization," 2020. Demonstrates that trajectory shape affects the width and quality of the final optimum, implying that perturbations along the path change the basin of convergence.
