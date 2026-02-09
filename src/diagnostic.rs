@@ -424,8 +424,6 @@ impl DiagnosticLayer {
         out: &mut Vec<DiagnosticWarning>,
     ) {
         for component in &self.components {
-            let grad_key = format!("{}.grad_norm", component);
-
             // Count how many recent steps had near-zero variance
             // Try both activation_variance_min and activation_variance keys
             let near_zero_var_count = self
@@ -442,8 +440,9 @@ impl DiagnosticLayer {
                 .history
                 .iter()
                 .filter(|m| {
-                    m.get(&grad_key)
-                        .map_or(false, |&v| v < self.config.unused_capacity_grad_floor)
+                    Self::resolve_grad_key(m, component)
+                        .and_then(|k| m.get(&k).copied())
+                        .map_or(false, |v| v < self.config.unused_capacity_grad_floor)
                 })
                 .count();
 
@@ -456,7 +455,8 @@ impl DiagnosticLayer {
             {
                 let current_var = Self::resolve_var_key(metrics, component)
                     .and_then(|k| metrics.get(&k).copied());
-                let current_grad = metrics.get(&grad_key).copied();
+                let current_grad = Self::resolve_grad_key(metrics, component)
+                    .and_then(|k| metrics.get(&k).copied());
 
                 let mut evidence = Vec::new();
                 if var_ratio >= self.config.unused_capacity_persistence {
@@ -729,16 +729,28 @@ impl DiagnosticLayer {
         let mut evidence = Vec::new();
 
         for component in &self.components {
-            let grad_key = format!("{}.grad_norm", component);
-
-            // Get recent grad norms
-            let recent_grads: Vec<f64> = self
-                .history
-                .iter()
-                .rev()
-                .take(10)
-                .filter_map(|m| m.get(&grad_key).copied())
-                .collect();
+            // Get recent grad norms — try grad_norm_min first, then grad_norm
+            let recent_grads: Vec<f64> = {
+                let min_key = format!("{}.grad_norm_min", component);
+                let plain_key = format!("{}.grad_norm", component);
+                let grads: Vec<f64> = self
+                    .history
+                    .iter()
+                    .rev()
+                    .take(10)
+                    .filter_map(|m| m.get(&min_key).copied())
+                    .collect();
+                if grads.is_empty() {
+                    self.history
+                        .iter()
+                        .rev()
+                        .take(10)
+                        .filter_map(|m| m.get(&plain_key).copied())
+                        .collect()
+                } else {
+                    grads
+                }
+            };
 
             if recent_grads.is_empty() {
                 continue;
@@ -1042,14 +1054,28 @@ impl DiagnosticLayer {
         let mut grad_evidence = Vec::new();
 
         for component in &self.components {
-            let grad_key = format!("{}.grad_norm", component);
-            let recent_grads: Vec<f64> = self
-                .history
-                .iter()
-                .rev()
-                .take(10)
-                .filter_map(|m| m.get(&grad_key).copied())
-                .collect();
+            // Try grad_norm_min first, then grad_norm
+            let recent_grads: Vec<f64> = {
+                let min_key = format!("{}.grad_norm_min", component);
+                let plain_key = format!("{}.grad_norm", component);
+                let grads: Vec<f64> = self
+                    .history
+                    .iter()
+                    .rev()
+                    .take(10)
+                    .filter_map(|m| m.get(&min_key).copied())
+                    .collect();
+                if grads.is_empty() {
+                    self.history
+                        .iter()
+                        .rev()
+                        .take(10)
+                        .filter_map(|m| m.get(&plain_key).copied())
+                        .collect()
+                } else {
+                    grads
+                }
+            };
 
             if recent_grads.is_empty() {
                 continue;
@@ -1440,12 +1466,12 @@ impl DiagnosticLayer {
         let all: Vec<&MetricSnapshot> = self.history.iter().collect();
 
         // Compute mean grad_norm per component, filtering out dead gradients
+        // Tries grad_norm_min first, then grad_norm (same pattern as variance key resolution)
         let grad_floor = 1e-7;
         let mut component_means: Vec<(&str, f64)> = Vec::new();
 
         for component in &self.components {
-            let grad_key = format!("{}.grad_norm", component);
-            if let Some(mean) = Self::mean_metric(&all, &grad_key) {
+            if let Some(mean) = Self::mean_grad_metric(&all, component) {
                 if mean >= grad_floor {
                     component_means.push((component, mean));
                 }
@@ -1649,6 +1675,29 @@ impl DiagnosticLayer {
         } else {
             Some(values.iter().sum::<f64>() / values.len() as f64)
         }
+    }
+
+    /// Resolve the actual gradient norm metric key for a component.
+    /// Tries `{component}.grad_norm_min` first (standard invariant name),
+    /// then falls back to `{component}.grad_norm`.
+    fn resolve_grad_key(snapshot: &MetricSnapshot, component: &str) -> Option<String> {
+        let min_key = format!("{}.grad_norm_min", component);
+        if snapshot.contains_key(&min_key) {
+            return Some(min_key);
+        }
+        let plain_key = format!("{}.grad_norm", component);
+        if snapshot.contains_key(&plain_key) {
+            return Some(plain_key);
+        }
+        None
+    }
+
+    /// Compute mean of a gradient norm metric across snapshots, trying `_min` suffix first.
+    fn mean_grad_metric(snapshots: &[&MetricSnapshot], component: &str) -> Option<f64> {
+        let min_key = format!("{}.grad_norm_min", component);
+        let plain_key = format!("{}.grad_norm", component);
+        Self::mean_metric(snapshots, &min_key)
+            .or_else(|| Self::mean_metric(snapshots, &plain_key))
     }
 
     /// Resolve the actual variance metric key for a component.
@@ -2680,6 +2729,36 @@ mod tests {
                 step,
             );
         }
+    }
+
+    #[test]
+    fn domination_works_with_grad_norm_min_keys() {
+        // CRUX convention: reports grad_norm_min, not grad_norm
+        let config = make_config();
+        let mut diag = DiagnosticLayer::new(
+            config,
+            vec!["encoder".into(), "bow_head".into(), "category_head".into()],
+        );
+
+        // Simulate CRUX's 400:1 gradient ratio using grad_norm_min keys
+        for step in 0..30 {
+            let mut m = HashMap::new();
+            m.insert("loss".into(), 5.0);
+            m.insert("encoder.grad_norm_min".into(), 0.1);
+            m.insert("encoder.pairwise_cosine".into(), 0.5);
+            m.insert("encoder.activation_variance_min".into(), 0.1);
+            m.insert("bow_head.grad_norm_min".into(), 2.0);       // dominant
+            m.insert("bow_head.pairwise_cosine".into(), 0.3);
+            m.insert("category_head.grad_norm_min".into(), 0.005); // starved (400x)
+            m.insert("category_head.pairwise_cosine".into(), 0.9);
+            let warnings = diag.diagnose(step, &m);
+            if let Some(w) = warnings.iter().find(|w| w.signal == DiagnosticSignal::GradientDomination) {
+                assert!(w.summary.contains("bow_head"), "should name bow_head as dominant");
+                assert!(w.confidence >= 0.3);
+                return;
+            }
+        }
+        panic!("Expected gradient domination warning with grad_norm_min keys");
     }
 
     // -----------------------------------------------------------------------
