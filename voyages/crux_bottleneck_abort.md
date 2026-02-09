@@ -293,10 +293,29 @@ Signal 11 names the mechanism. Signal 9 names the symptom. Signal 10 names the p
 
 ### Also in V2.4
 
+### V2.4 Validation Results (2026-02-08)
+
+Re-running CRUX with V2.4 produced **8 advisories** (up from 5 in V2.3):
+
+| Step | Signal | Component | Detail |
+|------|--------|-----------|--------|
+| 50 | UnusedCapacity | compressor | Variance below 1e-5 for 97% of steps (6.66e-7) |
+| 50 | MetricInstability | encoder | grad_norm CV=0.343 (new — enabled by grad key fix) |
+| 50 | MetricInstability | contrastive_head | grad_norm CV=0.679 |
+| 50 | MetricInstability | compressor | activation_variance CV=4.564 |
+| 50 | MetricInstability | compressor | grad_norm CV=0.373 (new — enabled by grad key fix) |
+| 50 | **GradientDomination** | category_head | **102x ratio, bow_head suppressed** |
+| 145 | InterventionFutility | category_head | 3 chronic interventions |
+| 145 | InterventionFutility | contrastive_head | 3 chronic interventions |
+
+**Surprise finding**: Signal 11 named `category_head` as the dominant component (mean grad 0.404) and `bow_head` as suppressed (mean grad 0.00397). This is the *opposite* of the design expectation — CRUX was engineered with a 400:1 output dimension ratio (2048 vs 5) to create gradient imbalance. But BCE loss across 2048 outputs produces many *small* per-parameter gradients, while CE loss with 5 classes concentrates the gradient signal. Signal 11 correctly measured the actual gradient norms, not the theoretical expectation.
+
+**Grad key fix bonus**: The `resolve_grad_key` fix (same pattern as V2.1's `resolve_var_key`) also unblocked 2 additional MetricInstability detections — encoder and compressor grad_norm oscillation that was invisible when diagnostics couldn't find the `grad_norm_min` keys.
+
 Two additional signals complete the advisory layer:
 
-- **Signal 12 (MetricAnomaly)**: NaN/Inf sentinel — catches corrupted training state before it silently propagates. Not relevant to CRUX (no numerical corruption), but defends against an entire class of silent failure.
-- **Signal 13 (TrainValDivergence)**: Overfitting detection — if the user reports `val_loss`, this signal activates automatically and detects train/val divergence. Zero-config. Not relevant to CRUX (aborted too early for overfitting), but covers the most common real-world training failure.
+- **Signal 12 (MetricAnomaly)**: NaN/Inf sentinel — not relevant to CRUX (no numerical corruption), but defends against an entire class of silent failure.
+- **Signal 13 (TrainValDivergence)**: Overfitting detection via train/val loss divergence. Not relevant to CRUX (aborted too early), but covers the most common real-world training failure.
 
 ---
 
@@ -309,5 +328,5 @@ Two additional signals complete the advisory layer:
 | `D:\CRUX\checkpoints\hint_221_supervisor.json` | Post-abort checkpoint |
 | `D:\CRUX\checkpoints\transxform_voyage.log` | Full training trace |
 | `D:\CRUX\checkpoints\transxform_certificate.json` | Training certificate |
-| `D:\CRUX\checkpoints\transxform_report.md` | Full TransXform report (V2.3 diagnostics) |
+| `D:\CRUX\checkpoints\transxform_report.md` | Full TransXform report (V2.4 diagnostics) |
 | `D:\CRUX\checkpoints\run_manifest.json` | Merkle chain manifest |
