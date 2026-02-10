@@ -33,6 +33,8 @@ pub enum LedgerEntryType {
     Advisory,
     /// V1.3: Runtime threshold amendment (adaptive relaxation).
     Amendment,
+    /// V1.5: Shadow-step rollback recommendation.
+    ShadowRollback,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -244,6 +246,36 @@ impl BoundaryLedger {
             regret_tag: None,
             entry_type: LedgerEntryType::Amendment,
         });
+    }
+
+    /// V1.5: Record a shadow-step rollback recommendation.
+    pub fn record_shadow_rollback(
+        &mut self,
+        step: u64,
+        phase: Phase,
+        violations: &[Violation],
+    ) {
+        for v in violations {
+            self.entries.push(LedgerEntry {
+                step,
+                timestamp: Utc::now(),
+                phase,
+                component: v.component.clone(),
+                invariant: v.invariant_name.clone(),
+                metric_snapshot: HashMap::new(),
+                action: Action::Abort {
+                    reason: "shadow_rollback".into(),
+                },
+                justification: format!(
+                    "Optimizer step introduced new violation: observed={:.6}, threshold={:.6}. \
+                     Rollback recommended.",
+                    v.observed, v.threshold,
+                ),
+                outcome: InterventionOutcome::Pending,
+                regret_tag: None,
+                entry_type: LedgerEntryType::ShadowRollback,
+            });
+        }
     }
 
     /// Record a phase transition.

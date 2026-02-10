@@ -20,23 +20,41 @@ use crate::regret::{RegretAssessment, RegretTracker};
 use crate::spec::TrainingSpec;
 use crate::types::*;
 
-/// The report returned from each supervisor step.
+/// The report returned from each [`Supervisor::step`] call.
+///
+/// Contains everything that happened during the step: violations detected,
+/// actions taken, phase transitions, diagnostic advisories, and the raw
+/// metrics snapshot. The training loop should inspect `actions_taken` and
+/// `pending_lr_adjustments` to apply framework-level changes.
 #[derive(Debug, Clone)]
 pub struct SupervisorReport {
+    /// The training step this report covers.
     pub step: u64,
+    /// The phase at the end of this step (after any transition).
     pub phase: Phase,
+    /// All invariant violations detected this step.
     pub violations: Vec<Violation>,
+    /// Actions executed by the supervisor (reinitialize, adjust_lr, etc.).
     pub actions_taken: Vec<Action>,
+    /// Metrics approaching (but not yet crossing) hard thresholds.
     pub near_misses: Vec<NearMiss>,
+    /// Phase transition that occurred this step, if any.
     pub phase_transition: Option<PhaseTransition>,
+    /// Failure signature IDs matched this step.
     pub signature_matches: Vec<String>,
+    /// Regret assessments closed this step (intervention outcome verdicts).
     pub regret_assessments: Vec<RegretAssessment>,
+    /// LR adjustments the training loop must apply (component, factor).
     pub pending_lr_adjustments: Vec<(String, f64)>,
+    /// Raw metrics collected this step.
     pub metrics: MetricSnapshot,
     /// V2: Advisory diagnostic warnings (non-authoritative).
     pub diagnostic_warnings: Vec<DiagnosticWarning>,
     /// V1.4: Hint that this is a good moment to checkpoint.
     pub checkpoint_hint: Option<CheckpointHint>,
+    /// V1.5: Shadow-step verdict — whether the training loop should roll back
+    /// the most recent optimizer step.
+    pub shadow_step_verdict: ShadowStepVerdict,
 }
 
 /// Main composition layer — orchestrates all subsystems (whitepaper §3).
@@ -177,6 +195,35 @@ impl<M: Model, C: MetricCollector<M>> Supervisor<M, C> {
             self.metric_history.pop_front();
         }
 
+        // V1.5: Discovery mode — collect metrics but suppress enforcement.
+        // Diagnostics still run (advisory, useful during discovery).
+        if self.spec.control.discovery_mode {
+            let diagnostic_warnings = self.diagnostic.diagnose(step, &metrics);
+            for warning in &diagnostic_warnings {
+                self.ledger.record_advisory(
+                    step,
+                    Phase::Bootstrap,
+                    &warning.signal.to_string(),
+                    &warning.summary,
+                );
+            }
+            return Ok(SupervisorReport {
+                step,
+                phase: Phase::Bootstrap,
+                violations: Vec::new(),
+                actions_taken: Vec::new(),
+                near_misses: Vec::new(),
+                phase_transition: None,
+                signature_matches: Vec::new(),
+                regret_assessments: Vec::new(),
+                pending_lr_adjustments: Vec::new(),
+                metrics,
+                diagnostic_warnings,
+                checkpoint_hint: None,
+                shadow_step_verdict: ShadowStepVerdict::None,
+            });
+        }
+
         // 2. Check failure signatures
         let signature_matches: Vec<String> = self
             .registry
@@ -223,13 +270,31 @@ impl<M: Model, C: MetricCollector<M>> Supervisor<M, C> {
             self.ledger.record_near_miss(step, phase, nm);
         }
 
+        // V1.5: Shadow-step evaluation — compare current vs previous step.
+        let shadow_step_verdict = if self.spec.control.shadow_step {
+            self.evaluate_shadow_step(&violations, &phase_thresholds, step)
+        } else {
+            ShadowStepVerdict::None
+        };
+
+        let skip_interventions = matches!(
+            shadow_step_verdict,
+            ShadowStepVerdict::RollbackRecommended { .. }
+        );
+
+        if let ShadowStepVerdict::RollbackRecommended { ref violations } = shadow_step_verdict {
+            self.ledger.record_shadow_rollback(step, phase, violations);
+        }
+
         // 5. Process violations → determine actions → execute → record
         //    Passive components are observed but not intervened on.
+        //    V1.5: Skip if shadow-step recommends rollback.
         let allowed_interventions = self.phase_controller.allowed_interventions();
         let allowed_ref: Option<Vec<String>> = allowed_interventions;
         let mut actions_taken = Vec::new();
         self.pending_lr.clear();
 
+        if !skip_interventions {
         for violation in &violations {
             // Skip interventions for passive components (observe only).
             // Violations still appear in the report for visibility.
@@ -329,6 +394,7 @@ impl<M: Model, C: MetricCollector<M>> Supervisor<M, C> {
                 }
             }
         }
+        } // end if !skip_interventions
 
         // Execute signature-matched proven fixes (if not already addressed by invariant violations)
         for sig_id in &signature_matches {
@@ -476,6 +542,7 @@ impl<M: Model, C: MetricCollector<M>> Supervisor<M, C> {
             metrics,
             diagnostic_warnings,
             checkpoint_hint,
+            shadow_step_verdict,
         })
     }
 
@@ -564,6 +631,85 @@ impl<M: Model, C: MetricCollector<M>> Supervisor<M, C> {
     /// V1.3: Get runtime threshold amendments (audit trail).
     pub fn runtime_amendments(&self) -> &[RuntimeAmendment] {
         &self.runtime_amendments
+    }
+
+    /// V1.5: Emit a discovery report analyzing the metric history collected
+    /// during discovery mode. Returns proposed thresholds based on observed
+    /// metric distributions.
+    ///
+    /// Can be called at any time, but is most useful after running enough steps
+    /// in discovery mode to build a representative metric history.
+    pub fn emit_discovery_report(&self, step: u64) -> crate::discovery::DiscoveryReport {
+        let history: Vec<MetricSnapshot> = self.metric_history.iter().cloned().collect();
+        let components = self.spec.model.components.clone();
+        crate::discovery::analyze(&history, &components, &crate::discovery::DiscoveryConfig::default(), step)
+    }
+
+    /// V1.5: Emit a discovery report with custom configuration.
+    pub fn emit_discovery_report_with_config(
+        &self,
+        config: &crate::discovery::DiscoveryConfig,
+        step: u64,
+    ) -> crate::discovery::DiscoveryReport {
+        let history: Vec<MetricSnapshot> = self.metric_history.iter().cloned().collect();
+        let components = self.spec.model.components.clone();
+        crate::discovery::analyze(&history, &components, config, step)
+    }
+
+    // -----------------------------------------------------------------------
+    // V1.5: Shadow-step evaluation
+    // -----------------------------------------------------------------------
+
+    /// Evaluate whether the most recent optimizer step should be rolled back.
+    ///
+    /// Compares current violations against the previous step's metrics. If the
+    /// previous step was clean but the current step has hard violations, the
+    /// optimizer step caused the degradation and rollback is recommended.
+    fn evaluate_shadow_step(
+        &self,
+        current_violations: &[Violation],
+        phase_thresholds: &HashMap<String, f64>,
+        step: u64,
+    ) -> ShadowStepVerdict {
+        // Only consider hard violations from active (non-passive) components
+        let hard_active: Vec<&Violation> = current_violations
+            .iter()
+            .filter(|v| v.severity == Severity::Hard && !self.spec.is_passive(&v.component))
+            .collect();
+
+        if hard_active.is_empty() {
+            return ShadowStepVerdict::Commit;
+        }
+
+        // Need at least 2 entries in history (current + previous)
+        if self.metric_history.len() < 2 {
+            return ShadowStepVerdict::InterventionRequired;
+        }
+
+        // metric_history[-1] is current (just pushed), [-2] is previous
+        let prev_metrics = &self.metric_history[self.metric_history.len() - 2];
+
+        // Check if previous step had hard violations from active components
+        let prev_violations = self.monitor.check(
+            prev_metrics,
+            phase_thresholds,
+            &self.spec.control,
+            step.saturating_sub(1),
+        );
+
+        let prev_had_hard_active = prev_violations
+            .iter()
+            .any(|v| v.severity == Severity::Hard && !self.spec.is_passive(&v.component));
+
+        if prev_had_hard_active {
+            // Violations existed before this optimizer step — rollback won't help
+            ShadowStepVerdict::InterventionRequired
+        } else {
+            // Previous step was clean, this step violated — optimizer step caused it
+            ShadowStepVerdict::RollbackRecommended {
+                violations: hard_active.into_iter().cloned().collect(),
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1464,6 +1610,335 @@ control:
         assert!(
             cosine_violations.is_empty(),
             "Relaxed threshold should prevent violations after transition"
+        );
+    }
+
+    // ===================================================================
+    // V1.5: Discovery mode
+    // ===================================================================
+
+    fn make_discovery_supervisor() -> (
+        Supervisor<MockModel, BasicMetricCollector>,
+        Rc<RefCell<MockModel>>,
+    ) {
+        let spec_yaml = r#"
+model:
+  name: "test-discovery"
+  components: [backbone, head]
+invariants:
+  hard:
+    head.pairwise_cosine: 0.95
+    head.grad_norm_min: 0.001
+  soft: {}
+phases:
+  bootstrap:
+    transition_guard:
+      all_hard_invariants_satisfied_for: 5
+control:
+  cooldown_steps: 10
+  max_hard_interventions: 3
+  hysteresis_margin: 0.0
+  damping_factor: 0.5
+  discovery_mode: true
+"#;
+        let spec = crate::spec::parse_spec(spec_yaml).expect("parse");
+        let model = Rc::new(RefCell::new(MockModel::new(&["backbone", "head"])));
+        let collector = BasicMetricCollector::new(
+            vec!["backbone".into(), "head".into()],
+            HashMap::new(),
+        );
+        let supervisor = Supervisor::new(spec, model.clone(), collector).expect("new");
+        (supervisor, model)
+    }
+
+    #[test]
+    fn discovery_mode_suppresses_enforcement() {
+        let (mut supervisor, model) = make_discovery_supervisor();
+
+        // Set metrics that would normally violate hard invariants
+        {
+            let mut m = model.borrow_mut();
+            m.set_metric("head", "pairwise_cosine", 0.99); // > 0.95 → would violate
+            m.set_metric("head", "grad_norm_min", 0.0001); // < 0.001 → would violate
+            m.set_metric("backbone", "pairwise_cosine", 0.3);
+            m.set_metric("backbone", "grad_norm_min", 0.05);
+            m.set_global_metric("loss", 2.0);
+        }
+
+        for step in 0..20 {
+            let report = supervisor.step(step).unwrap();
+            assert!(
+                report.violations.is_empty(),
+                "Step {}: discovery mode should suppress violations",
+                step,
+            );
+            assert!(
+                report.actions_taken.is_empty(),
+                "Step {}: discovery mode should suppress actions",
+                step,
+            );
+            assert_eq!(
+                report.phase,
+                Phase::Bootstrap,
+                "Step {}: discovery mode should stay in Bootstrap",
+                step,
+            );
+        }
+    }
+
+    #[test]
+    fn discovery_mode_still_runs_diagnostics() {
+        let (mut supervisor, model) = make_discovery_supervisor();
+
+        // Configure fast diagnostics
+        {
+            let diag = supervisor.diagnostic_mut();
+            let mut config = crate::diagnostic::DiagnosticConfig::default();
+            config.warmup_steps = 5;
+            config.cadence = 1;
+            config.history_window = 20;
+            *diag = crate::diagnostic::DiagnosticLayer::new(
+                config,
+                vec!["backbone".into(), "head".into()],
+            );
+        }
+
+        // Set pathological metrics that should trigger diagnostics
+        {
+            let mut m = model.borrow_mut();
+            m.set_metric("head", "pairwise_cosine", 0.5);
+            m.set_metric("head", "grad_norm_min", 0.01);
+            m.set_metric("head", "activation_variance_min", 1e-7); // near-zero
+            m.set_metric("backbone", "pairwise_cosine", 0.3);
+            m.set_metric("backbone", "grad_norm_min", 0.05);
+            m.set_metric("backbone", "activation_variance_min", 0.1);
+            m.set_global_metric("loss", 2.0);
+        }
+
+        let mut any_diagnostic = false;
+        for step in 0..30 {
+            let report = supervisor.step(step).unwrap();
+            if !report.diagnostic_warnings.is_empty() {
+                any_diagnostic = true;
+            }
+        }
+
+        assert!(
+            any_diagnostic,
+            "Diagnostics should still run during discovery mode"
+        );
+    }
+
+    // ===================================================================
+    // V1.5: Shadow-stepping
+    // ===================================================================
+
+    fn make_shadow_step_supervisor() -> (
+        Supervisor<MockModel, BasicMetricCollector>,
+        Rc<RefCell<MockModel>>,
+    ) {
+        let spec_yaml = r#"
+model:
+  name: "test-shadow"
+  components: [backbone, head]
+invariants:
+  hard:
+    head.pairwise_cosine: 0.95
+    head.grad_norm_min: 0.001
+  soft: {}
+phases:
+  bootstrap:
+    transition_guard:
+      all_hard_invariants_satisfied_for: 50
+control:
+  cooldown_steps: 10
+  max_hard_interventions: 3
+  hysteresis_margin: 0.0
+  damping_factor: 0.5
+  shadow_step: true
+"#;
+        let spec = crate::spec::parse_spec(spec_yaml).expect("parse");
+        let model = Rc::new(RefCell::new(MockModel::new(&["backbone", "head"])));
+        let collector = BasicMetricCollector::new(
+            vec!["backbone".into(), "head".into()],
+            HashMap::new(),
+        );
+        let supervisor = Supervisor::new(spec, model.clone(), collector).expect("new");
+        (supervisor, model)
+    }
+
+    #[test]
+    fn shadow_step_rollback_on_new_violation() {
+        let (mut supervisor, model) = make_shadow_step_supervisor();
+
+        // Step 0: healthy metrics
+        {
+            let mut m = model.borrow_mut();
+            m.set_metric("head", "pairwise_cosine", 0.5);
+            m.set_metric("head", "grad_norm_min", 0.01);
+            m.set_metric("backbone", "grad_norm_min", 0.05);
+            m.set_global_metric("loss", 2.0);
+        }
+        let r0 = supervisor.step(0).unwrap();
+        assert!(matches!(r0.shadow_step_verdict, ShadowStepVerdict::Commit));
+
+        // Step 1: introduce violation (cosine jumps from 0.5 to 0.99)
+        {
+            let mut m = model.borrow_mut();
+            m.set_metric("head", "pairwise_cosine", 0.99);
+        }
+        let r1 = supervisor.step(1).unwrap();
+        assert!(
+            matches!(r1.shadow_step_verdict, ShadowStepVerdict::RollbackRecommended { .. }),
+            "Should recommend rollback when previous step was clean but current violates"
+        );
+        // Interventions should be skipped
+        assert!(
+            r1.actions_taken.is_empty(),
+            "Shadow-step rollback should suppress interventions"
+        );
+    }
+
+    #[test]
+    fn shadow_step_intervention_when_previous_was_bad() {
+        let (mut supervisor, model) = make_shadow_step_supervisor();
+
+        // Step 0: already violating
+        {
+            let mut m = model.borrow_mut();
+            m.set_metric("head", "pairwise_cosine", 0.99);
+            m.set_metric("head", "grad_norm_min", 0.01);
+            m.set_metric("backbone", "grad_norm_min", 0.05);
+            m.set_global_metric("loss", 2.0);
+        }
+        supervisor.step(0).unwrap();
+
+        // Step 1: still violating
+        let r1 = supervisor.step(1).unwrap();
+        assert!(
+            matches!(r1.shadow_step_verdict, ShadowStepVerdict::InterventionRequired),
+            "Should require intervention when previous step also had violations"
+        );
+    }
+
+    #[test]
+    fn shadow_step_commit_when_clean() {
+        let (mut supervisor, model) = make_shadow_step_supervisor();
+
+        // Both steps clean
+        {
+            let mut m = model.borrow_mut();
+            m.set_metric("head", "pairwise_cosine", 0.5);
+            m.set_metric("head", "grad_norm_min", 0.01);
+            m.set_metric("backbone", "grad_norm_min", 0.05);
+            m.set_global_metric("loss", 2.0);
+        }
+        supervisor.step(0).unwrap();
+        let r1 = supervisor.step(1).unwrap();
+        assert!(
+            matches!(r1.shadow_step_verdict, ShadowStepVerdict::Commit),
+            "Should commit when no violations exist"
+        );
+    }
+
+    #[test]
+    fn shadow_step_disabled_by_default() {
+        // test_supervisor() doesn't set shadow_step: true
+        let (mut supervisor, model) = test_supervisor();
+
+        {
+            let mut m = model.borrow_mut();
+            m.set_metric("head", "pairwise_cosine", 0.5);
+            m.set_metric("head", "grad_norm", 0.0005);
+            m.set_metric("backbone", "grad_norm", 0.05);
+            m.set_global_metric("loss", 2.0);
+        }
+        supervisor.step(0).unwrap();
+
+        {
+            let mut m = model.borrow_mut();
+            m.set_metric("head", "pairwise_cosine", 0.99);
+        }
+        let r1 = supervisor.step(1).unwrap();
+        assert!(
+            matches!(r1.shadow_step_verdict, ShadowStepVerdict::None),
+            "Shadow-step should be None when disabled"
+        );
+        // With shadow_step disabled, interventions should proceed normally
+        assert!(
+            !r1.actions_taken.is_empty(),
+            "Without shadow-step, violations should trigger interventions"
+        );
+    }
+
+    #[test]
+    fn shadow_step_ledger_records_rollback() {
+        let (mut supervisor, model) = make_shadow_step_supervisor();
+
+        {
+            let mut m = model.borrow_mut();
+            m.set_metric("head", "pairwise_cosine", 0.5);
+            m.set_metric("head", "grad_norm_min", 0.01);
+            m.set_metric("backbone", "grad_norm_min", 0.05);
+            m.set_global_metric("loss", 2.0);
+        }
+        supervisor.step(0).unwrap();
+
+        {
+            let mut m = model.borrow_mut();
+            m.set_metric("head", "pairwise_cosine", 0.99);
+        }
+        supervisor.step(1).unwrap();
+
+        let rollback_entries: Vec<_> = supervisor
+            .ledger()
+            .entries()
+            .iter()
+            .filter(|e| matches!(e.entry_type, crate::ledger::LedgerEntryType::ShadowRollback))
+            .collect();
+        assert!(
+            !rollback_entries.is_empty(),
+            "Ledger should contain ShadowRollback entries"
+        );
+        assert_eq!(rollback_entries[0].step, 1);
+    }
+
+    #[test]
+    fn emit_discovery_report_produces_proposals() {
+        let (mut supervisor, model) = make_discovery_supervisor();
+
+        {
+            let mut m = model.borrow_mut();
+            m.set_metric("head", "pairwise_cosine", 0.5);
+            m.set_metric("head", "grad_norm_min", 0.01);
+            m.set_metric("backbone", "pairwise_cosine", 0.3);
+            m.set_metric("backbone", "grad_norm_min", 0.05);
+            m.set_global_metric("loss", 2.0);
+        }
+
+        // Run enough steps to build history
+        for step in 0..100 {
+            supervisor.step(step).unwrap();
+        }
+
+        let config = crate::discovery::DiscoveryConfig {
+            min_samples: 10,
+            ..Default::default()
+        };
+        let report = supervisor.emit_discovery_report_with_config(&config, 100);
+
+        assert_eq!(report.observation_steps, 100);
+        assert!(
+            !report.proposals.is_empty(),
+            "Discovery report should contain threshold proposals"
+        );
+
+        // Check that we have proposals for known metrics
+        let cosine_proposal = report.proposals.iter()
+            .find(|p| p.metric_key == "head.pairwise_cosine");
+        assert!(
+            cosine_proposal.is_some(),
+            "Should have proposal for head.pairwise_cosine"
         );
     }
 }

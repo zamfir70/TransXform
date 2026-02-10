@@ -69,6 +69,22 @@ pub trait Model {
     /// The supervisor will include the adjustment in
     /// `SupervisorReport.pending_lr_adjustments` for the training loop to apply.
     fn adjust_lr(&mut self, component: &str, factor: f64) -> Result<(), TransXformError>;
+
+    /// Reset optimizer state (momentum, variance accumulators) for a component.
+    ///
+    /// Called automatically after [`reinitialize`](Model::reinitialize) to prevent
+    /// momentum corpses — Adam's exponential moving averages remember the
+    /// pre-reinit gradient trajectory for ~β₂⁻¹ steps (typically ~999), causing
+    /// the freshly initialized parameters to drift back toward the degenerate
+    /// state (whitepaper §2.1).
+    ///
+    /// The default implementation is a no-op for backward compatibility.
+    /// Implementations with optimizer access should zero the first-moment (m)
+    /// and second-moment (v) accumulators for the named component's parameters.
+    fn reset_optimizer_state(&mut self, component: &str) -> Result<(), TransXformError> {
+        let _ = component;
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -211,6 +227,13 @@ impl Model for MockModel {
         self.check_component(component)?;
         self.interventions
             .push((component.to_string(), format!("adjust_lr({:.4})", factor)));
+        Ok(())
+    }
+
+    fn reset_optimizer_state(&mut self, component: &str) -> Result<(), TransXformError> {
+        self.check_component(component)?;
+        self.interventions
+            .push((component.to_string(), "reset_optimizer_state".to_string()));
         Ok(())
     }
 }

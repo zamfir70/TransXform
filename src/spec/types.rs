@@ -180,6 +180,20 @@ pub struct ControlConfig {
     /// Default: 0.02 (2%).
     #[serde(default = "default_max_relaxation")]
     pub max_threshold_relaxation: f64,
+
+    /// V1.5: Discovery mode. When enabled, the supervisor suppresses all invariant
+    /// enforcement, stays in Bootstrap, and collects metric statistics. Use
+    /// `Supervisor::emit_discovery_report()` to retrieve proposed thresholds.
+    /// Default: false.
+    #[serde(default)]
+    pub discovery_mode: bool,
+
+    /// V1.5: Shadow-stepping. When enabled, the supervisor compares post-optimizer
+    /// metrics against the previous step. If the optimizer step introduced new
+    /// hard violations, it recommends rollback instead of destructive intervention.
+    /// Default: false.
+    #[serde(default)]
+    pub shadow_step: bool,
 }
 
 impl ControlConfig {

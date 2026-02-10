@@ -291,8 +291,6 @@ For CRUX, the detection chain would be:
 
 Signal 11 names the mechanism. Signal 9 names the symptom. Signal 10 names the prognosis. Together, the three signals tell the complete story: "bow_head is monopolizing the optimizer (Signal 11), causing instability in downstream components (Signal 9), and no amount of reinitialization will fix a gradient magnitude mismatch (Signal 10)."
 
-### Also in V2.4
-
 ### V2.4 Validation Results (2026-02-08)
 
 Re-running CRUX with V2.4 produced **8 advisories** (up from 5 in V2.3):

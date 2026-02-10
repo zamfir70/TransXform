@@ -14,6 +14,14 @@ pub struct Report {
     pub final_health: FinalHealthSnapshot,
     /// V2: Diagnostic advisories (non-authoritative).
     pub diagnostic_advisories: DiagnosticAdvisories,
+    /// V1.5: Shadow-step rollback summary.
+    pub shadow_step_summary: ShadowStepSummary,
+}
+
+/// V1.5: Summary of shadow-step rollback recommendations during training.
+pub struct ShadowStepSummary {
+    pub total_rollbacks: u64,
+    pub rollback_steps: Vec<u64>,
 }
 
 /// V2: Advisory diagnostic section — collected from the diagnostic layer.
@@ -108,6 +116,7 @@ pub fn generate_report_with_diagnostics(
         regret_analysis: build_regret_analysis(certificate, ledger),
         final_health: build_final_health(certificate),
         diagnostic_advisories: build_diagnostic_advisories(diagnostic),
+        shadow_step_summary: build_shadow_step_summary(ledger),
     }
 }
 
@@ -142,6 +151,21 @@ fn build_diagnostic_advisories(diagnostic: Option<&DiagnosticLayer>) -> Diagnost
         total,
         acknowledged,
         unacknowledged: total - acknowledged,
+    }
+}
+
+fn build_shadow_step_summary(ledger: &BoundaryLedger) -> ShadowStepSummary {
+    let mut rollback_steps: Vec<u64> = ledger
+        .entries()
+        .iter()
+        .filter(|e| matches!(e.entry_type, LedgerEntryType::ShadowRollback))
+        .map(|e| e.step)
+        .collect();
+    rollback_steps.sort();
+    rollback_steps.dedup();
+    ShadowStepSummary {
+        total_rollbacks: rollback_steps.len() as u64,
+        rollback_steps,
     }
 }
 
@@ -398,6 +422,24 @@ impl Report {
             }
         }
 
+        // Shadow-Step Summary (V1.5)
+        if self.shadow_step_summary.total_rollbacks > 0 {
+            out.push_str("\n## Shadow-Step Rollbacks\n\n");
+            out.push_str(&format!(
+                "- **Total rollback recommendations:** {}\n",
+                self.shadow_step_summary.total_rollbacks,
+            ));
+            out.push_str(&format!(
+                "- **Steps:** {}\n",
+                self.shadow_step_summary
+                    .rollback_steps
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ));
+        }
+
         // Final Health
         out.push_str("\n## Final Health Snapshot\n\n");
         if let Some(loss) = self.final_health.overall_loss {
@@ -469,6 +511,10 @@ impl Report {
                         "status": c.status,
                     })
                 }).collect::<Vec<_>>(),
+            },
+            "shadow_step_summary": {
+                "total_rollbacks": self.shadow_step_summary.total_rollbacks,
+                "rollback_steps": self.shadow_step_summary.rollback_steps,
             },
             "diagnostic_advisories": {
                 "total": self.diagnostic_advisories.total,

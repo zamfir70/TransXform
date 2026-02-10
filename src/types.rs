@@ -340,6 +340,45 @@ impl fmt::Display for RuntimeAmendment {
 }
 
 // ---------------------------------------------------------------------------
+// ShadowStepVerdict (V1.5)
+// ---------------------------------------------------------------------------
+
+/// Shadow-step verdict — recommendation to the training loop about whether
+/// the most recent optimizer step should be rolled back (V1.5, §15.6).
+///
+/// TransXform is framework-agnostic: it recommends, the training loop decides.
+/// Model checkpointing is the user's responsibility.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "verdict", rename_all = "snake_case")]
+pub enum ShadowStepVerdict {
+    /// Shadow-stepping is disabled — no recommendation.
+    None,
+    /// The optimizer step did not introduce new hard violations — commit it.
+    Commit,
+    /// The optimizer step introduced new hard violations that were not present
+    /// in the previous step. Rolling back is recommended.
+    RollbackRecommended {
+        violations: Vec<Violation>,
+    },
+    /// Hard violations existed before the optimizer step — rollback would not
+    /// help. Normal intervention proceeds.
+    InterventionRequired,
+}
+
+impl fmt::Display for ShadowStepVerdict {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ShadowStepVerdict::None => write!(f, "none"),
+            ShadowStepVerdict::Commit => write!(f, "commit"),
+            ShadowStepVerdict::RollbackRecommended { violations } => {
+                write!(f, "rollback_recommended ({} violations)", violations.len())
+            }
+            ShadowStepVerdict::InterventionRequired => write!(f, "intervention_required"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // PhaseTransition
 // ---------------------------------------------------------------------------
 

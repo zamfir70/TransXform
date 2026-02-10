@@ -6,7 +6,7 @@ use std::rc::Rc;
 
 use transxform::*;
 use transxform::collector::BasicMetricCollector;
-use transxform::report::generate_report;
+use transxform::report::{generate_report, generate_report_with_diagnostics};
 
 fn make_supervisor(
     spec_yaml: &str,
@@ -543,4 +543,248 @@ fn checkpoint_hint_fires_on_phase_transition() {
     }
 
     assert!(got_hint, "Should have received at least one checkpoint hint near phase transition");
+}
+
+// =========================================================================
+// Scenario 16: Diagnostic layer fires advisory warnings on pathological metrics
+// =========================================================================
+
+#[test]
+fn diagnostic_layer_fires_on_pathological_metrics() {
+    let spec = r#"
+model:
+  name: "test-diagnostic"
+  components: [backbone, head]
+invariants:
+  hard:
+    head.pairwise_cosine: 0.95
+    head.grad_norm_min: 0.001
+    head.activation_variance_min: 0.00000001
+  soft: {}
+phases:
+  bootstrap:
+    transition_guard:
+      all_hard_invariants_satisfied_for: 5
+control:
+  cooldown_steps: 10
+  max_hard_interventions: 3
+  hysteresis_margin: 0.0
+  damping_factor: 0.5
+  regret_window_steps: 20
+"#;
+
+    let (mut supervisor, model) = make_supervisor(spec, &["backbone", "head"]);
+
+    // Configure diagnostic for fast feedback: warmup=10, cadence=1
+    {
+        let diag = supervisor.diagnostic_mut();
+        let mut config = DiagnosticConfig::default();
+        config.warmup_steps = 10;
+        config.cadence = 1;
+        config.history_window = 20;
+        *diag = DiagnosticLayer::new(config, vec!["backbone".into(), "head".into()]);
+    }
+
+    // Feed metrics where head has near-zero activation variance (UnusedCapacity)
+    // but all hard invariants are satisfied (below thresholds)
+    {
+        let mut m = model.borrow_mut();
+        m.set_metric("head", "pairwise_cosine", 0.5);
+        m.set_metric("head", "grad_norm_min", 0.01);
+        m.set_metric("head", "activation_variance_min", 1e-6); // above hard floor but below diagnostic 1e-5
+        m.set_metric("backbone", "grad_norm_min", 0.05);
+        m.set_metric("backbone", "pairwise_cosine", 0.3);
+        m.set_metric("backbone", "activation_variance_min", 0.1);
+        m.set_global_metric("loss", 2.0);
+    }
+
+    let mut any_diagnostic_warning = false;
+    for step in 0..30 {
+        let report = supervisor.step(step).unwrap();
+        // No hard violations — all invariants satisfied
+        assert!(
+            report.violations.is_empty(),
+            "Step {}: unexpected violation: {:?}",
+            step,
+            report.violations,
+        );
+        if !report.diagnostic_warnings.is_empty() {
+            any_diagnostic_warning = true;
+        }
+    }
+
+    assert!(
+        any_diagnostic_warning,
+        "Diagnostic layer should fire at least one advisory warning for near-zero activation variance"
+    );
+
+    // Verify warnings appear in certificate
+    let cert = supervisor.emit_certificate(30);
+    assert!(
+        cert.diagnostic_summary.total_warnings > 0,
+        "Certificate should contain diagnostic warnings"
+    );
+
+    // Verify warnings appear in the report
+    let report = generate_report_with_diagnostics(
+        &cert,
+        supervisor.ledger(),
+        Some(supervisor.diagnostic()),
+    );
+    let md = report.to_markdown();
+    assert!(
+        md.contains("Diagnostic Advisories"),
+        "Report should contain Diagnostic Advisories section"
+    );
+}
+
+// =========================================================================
+// Scenario 17: Discovery mode collects metrics and proposes thresholds
+// =========================================================================
+
+#[test]
+fn discovery_mode_collects_and_proposes_thresholds() {
+    let spec = r#"
+model:
+  name: "test-discovery"
+  components: [backbone, head]
+invariants:
+  hard:
+    head.pairwise_cosine: 0.95
+    head.grad_norm_min: 0.001
+  soft: {}
+phases:
+  bootstrap:
+    transition_guard:
+      all_hard_invariants_satisfied_for: 5
+control:
+  cooldown_steps: 10
+  max_hard_interventions: 3
+  hysteresis_margin: 0.0
+  damping_factor: 0.5
+  discovery_mode: true
+"#;
+
+    let (mut supervisor, model) = make_supervisor(spec, &["backbone", "head"]);
+
+    // Set metrics that would normally violate invariants
+    {
+        let mut m = model.borrow_mut();
+        m.set_metric("head", "pairwise_cosine", 0.99);
+        m.set_metric("head", "grad_norm_min", 0.0001);
+        m.set_metric("backbone", "pairwise_cosine", 0.3);
+        m.set_metric("backbone", "grad_norm_min", 0.05);
+        m.set_global_metric("loss", 2.0);
+    }
+
+    // Run 100 steps in discovery mode
+    for step in 0..100 {
+        let report = supervisor.step(step).unwrap();
+        assert!(report.violations.is_empty(), "Discovery mode should suppress violations");
+        assert!(report.actions_taken.is_empty(), "Discovery mode should suppress actions");
+        assert_eq!(report.phase, Phase::Bootstrap, "Discovery mode should stay in bootstrap");
+    }
+
+    // Emit discovery report with relaxed min_samples
+    let config = transxform::DiscoveryConfig {
+        min_samples: 10,
+        ..Default::default()
+    };
+    let report = supervisor.emit_discovery_report_with_config(&config, 100);
+
+    assert_eq!(report.observation_steps, 100);
+    assert!(!report.proposals.is_empty(), "Should produce threshold proposals");
+
+    // Verify specific proposals exist
+    let cosine = report.proposals.iter()
+        .find(|p| p.metric_key == "head.pairwise_cosine");
+    assert!(cosine.is_some(), "Should propose threshold for head.pairwise_cosine");
+
+    let grad = report.proposals.iter()
+        .find(|p| p.metric_key == "head.grad_norm_min");
+    assert!(grad.is_some(), "Should propose threshold for head.grad_norm_min");
+
+    // Verify direction inference
+    let grad = grad.unwrap();
+    assert_eq!(grad.direction, transxform::types::ThresholdDirection::Min);
+}
+
+// =========================================================================
+// Scenario 18: Shadow-step recommends rollback and appears in report
+// =========================================================================
+
+#[test]
+fn shadow_step_rollback_and_report() {
+    let spec = r#"
+model:
+  name: "test-shadow"
+  components: [backbone, head]
+invariants:
+  hard:
+    head.pairwise_cosine: 0.95
+    head.grad_norm_min: 0.001
+  soft: {}
+phases:
+  bootstrap:
+    transition_guard:
+      all_hard_invariants_satisfied_for: 50
+control:
+  cooldown_steps: 10
+  max_hard_interventions: 3
+  hysteresis_margin: 0.0
+  damping_factor: 0.5
+  shadow_step: true
+"#;
+
+    let (mut supervisor, model) = make_supervisor(spec, &["backbone", "head"]);
+
+    // Step 0: healthy
+    {
+        let mut m = model.borrow_mut();
+        m.set_metric("head", "pairwise_cosine", 0.5);
+        m.set_metric("head", "grad_norm_min", 0.01);
+        m.set_metric("backbone", "grad_norm_min", 0.05);
+        m.set_global_metric("loss", 2.0);
+    }
+    let r0 = supervisor.step(0).unwrap();
+    assert!(r0.actions_taken.is_empty());
+
+    // Step 1: sudden violation — shadow-step should recommend rollback
+    {
+        let mut m = model.borrow_mut();
+        m.set_metric("head", "pairwise_cosine", 0.99);
+    }
+    let r1 = supervisor.step(1).unwrap();
+    assert!(
+        matches!(r1.shadow_step_verdict, transxform::types::ShadowStepVerdict::RollbackRecommended { .. }),
+        "Shadow-step should recommend rollback"
+    );
+    assert!(r1.actions_taken.is_empty(), "Interventions should be suppressed");
+
+    // Step 2: "user" rolled back — metrics healthy again
+    {
+        let mut m = model.borrow_mut();
+        m.set_metric("head", "pairwise_cosine", 0.5);
+    }
+    let r2 = supervisor.step(2).unwrap();
+    assert!(
+        matches!(r2.shadow_step_verdict, transxform::types::ShadowStepVerdict::Commit),
+        "After rollback, should be clean commit"
+    );
+
+    // Verify rollback appears in report
+    let cert = supervisor.emit_certificate(3);
+    let report = generate_report(&cert, supervisor.ledger());
+    let md = report.to_markdown();
+    assert!(
+        md.contains("Shadow-Step Rollbacks"),
+        "Report should contain Shadow-Step Rollbacks section"
+    );
+    assert_eq!(report.shadow_step_summary.total_rollbacks, 1);
+    assert_eq!(report.shadow_step_summary.rollback_steps, vec![1]);
+
+    // Verify JSON includes shadow-step summary
+    let json = report.to_json().unwrap();
+    assert!(json.contains("shadow_step_summary"));
+    assert!(json.contains("total_rollbacks"));
 }

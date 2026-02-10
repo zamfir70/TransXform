@@ -26,7 +26,17 @@ impl<M: Model> InterventionExecutor<M> {
         match action {
             Action::Reinitialize { component } => {
                 log::info!("Executing: reinitialize({})", component);
-                self.model.borrow_mut().reinitialize(component)
+                self.model.borrow_mut().reinitialize(component)?;
+                // Zero optimizer momentum/variance to prevent corpses (§2.1).
+                // Best-effort: if the model doesn't support this, the reinit
+                // still succeeded — just log and continue.
+                if let Err(e) = self.model.borrow_mut().reset_optimizer_state(component) {
+                    log::warn!(
+                        "Optimizer state reset failed for {}: {} (reinit still applied)",
+                        component, e
+                    );
+                }
+                Ok(())
             }
             Action::Freeze { component } => {
                 log::info!("Executing: freeze({})", component);
@@ -78,9 +88,9 @@ mod tests {
         executor.execute(&action).unwrap();
 
         let interventions = model.borrow().interventions().to_vec();
-        assert_eq!(interventions.len(), 1);
-        assert_eq!(interventions[0].0, "head");
-        assert_eq!(interventions[0].1, "reinitialize");
+        assert_eq!(interventions.len(), 2);
+        assert_eq!(interventions[0], ("head".into(), "reinitialize".into()));
+        assert_eq!(interventions[1], ("head".into(), "reset_optimizer_state".into()));
     }
 
     #[test]

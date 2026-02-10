@@ -96,6 +96,10 @@ Training (TransXform): Optimizer commits update → Supervisor evaluates → Acc
 
 **A note on authority semantics.** TransXform v1 uses **post-commit authority**, not pre-commit gating. The optimizer step executes first; the supervisor then observes the resulting state and intervenes if invariants are violated. This is a deliberate engineering choice: pre-commit gating (holding the optimizer step pending approval) would require shadow-stepping or checkpoint-and-rollback on every training step, imposing unacceptable overhead. Post-commit correction is cheaper, simpler, and sufficient — the supervisor can reinitialize, rescale, or roll back any component within the same step boundary. The invariant is not "bad states never occur" but "bad states never *persist*." Future implementations may support shadow-step evaluation or delayed commit for high-risk phases where even transient illegal states are unacceptable.
 
+**A limitation of post-commit correction.** The claim that "bad states never persist" is weaker than it appears for adaptive optimizers. When TransXform reinitializes a component's weights, optimizers like Adam retain momentum and variance EMAs computed from the pre-reinit parameter trajectory. These "momentum corpses" decay with a half-life of roughly β₂/(1−β₂) steps (~999 for standard β₂=0.999), meaning the optimizer continues pushing toward the old, discredited state for hundreds of steps after reinit. The supervisor corrects the *parameters* but not the *optimizer state* — it has no authority over the optimizer's internal accumulators.
+
+Mitigations under investigation include **selective shadow-stepping** (running a trial optimizer step, evaluating the result against invariants, and only committing if it passes) for high-risk phases, and **optimizer state reset** (zeroing momentum/variance EMAs for the reinitialized component). Both add complexity; the current post-commit design is honest about this gap. See §15.6.
+
 ### 2.2 Loss Is Telemetry, Not Truth
 
 Loss is observed, never trusted. Training success is defined as **invariant satisfaction**, not loss minimization. A run where loss decreases while representations collapse is a failed run. A run where loss plateaus but all invariants hold is a healthy run awaiting signal.
@@ -292,6 +296,22 @@ Thresholds are expected to originate from:
 All thresholds are explicit, logged, and versioned in the training spec. When a threshold proves wrong — too tight (false interventions) or too loose (missed failures) — the ledger provides the evidence to adjust it. The system's invariant is not "thresholds are always correct" but "threshold errors are always visible."
 
 **This system does not remove judgment. It removes ambiguity.**
+
+### 4.7 Threshold Discovery: Bootstrap as Observation
+
+The preceding section describes where thresholds come from *once a practitioner has them*. But for novel architectures — the first run of the first variant — there is no prior data, no architecture profile, and no failure history. **The hardest problem is not enforcing thresholds. It is knowing what they should be.**
+
+TransXform's bootstrap phase is designed to serve double duty. In its default mode, bootstrap enforces relaxed invariants while the model's random initialization settles. But it can also run in **observation-only mode**: all invariants are monitored but none are enforced, and the supervisor records the full metric distribution for every component.
+
+At the end of the observation window, the system proposes thresholds derived from the observed data:
+
+- **Hard floors/ceilings**: 1st/99th percentile of observed metric ranges, with a configurable safety margin.
+- **Soft targets**: Median observed values, adjusted by the metric's natural variance.
+- **Phase transitions**: Step numbers where metric distributions shift detectably.
+
+These proposals are exactly that — proposals. They require human review before they become spec entries. The system does not claim to know what healthy training looks like for an architecture it has never seen. It claims to *measure* what training actually looks like, and to present those measurements in a form that makes threshold authorship tractable.
+
+This is the distinction between **threshold enforcement** (V1) and **threshold discovery** — and for novel architectures, discovery is the harder problem. See §15.8.
 
 ---
 
@@ -571,6 +591,16 @@ The V1 supervisor is reactive — it detects invariant violations and intervenes
 | 12 | MetricAnomaly | NaN or Inf in any metric — numerical corruption sentinel | — |
 | 13 | TrainValDivergence | Training loss decreasing while validation loss increasing — overfitting | — |
 
+**A note on Signal #5 (ShortcutLearning).** Variance explosion with simultaneous loss improvement is the canonical signature of shortcut learning — but it is also the signature of legitimate complex representation formation. When a model transitions from smooth, low-variance features to rich, high-variance features, the metric trajectory is indistinguishable from shortcut exploitation at the activation-variance level alone.
+
+The current implementation mitigates this in three ways:
+
+1. **Conservative confidence ceiling**: Signal #5 caps at 0.5 confidence, reflecting genuine ambiguity.
+2. **Correlation with Signal #13 (TrainValDivergence)**: True shortcut learning typically degrades validation performance. If Signal #5 fires but validation loss continues improving, the shortcut hypothesis is weakened.
+3. **Threshold calibration**: The default `shortcut_variance_explosion` threshold (100% increase) filters out moderate variance growth that is characteristic of healthy learning.
+
+A more principled discrimination would require **rank analysis** of the representation matrix — shortcuts concentrate variance in a low-rank subspace, while legitimate learning distributes it. This is a Tier 2 metric not yet implemented (see §15.7).
+
 ### 12.3 Integration with V1
 
 The diagnostic layer runs inside `supervisor.step()`, after the V1 invariant check and control laws. Warnings are recorded in the boundary ledger as `Advisory` entries and summarized in the training certificate and report.
@@ -640,6 +670,18 @@ Given full audit logs, emit a cryptographically verifiable certificate attesting
 ### 15.5 Distributed / Multi-Node Training
 
 TransXform runs at the trainer level, not inside the model. Metrics can be reduced across workers; authority decisions are centralized. Simpler than synchronizing optimizers.
+
+### 15.6 Selective Shadow-Stepping
+
+Post-commit authority (§2.1) has a known gap: adaptive optimizers retain momentum from pre-intervention states. **Selective shadow-stepping** runs a trial optimizer step, evaluates the resulting state against invariants, and only commits if it passes. This is expensive — it requires checkpointing and potentially rolling back the optimizer state — and is only justified for high-risk phases (e.g., phase transitions, post-reinit recovery). A hybrid approach applies shadow-stepping only when regret scores (§6.4) indicate recent interventions are failing.
+
+### 15.7 Rank-Based Shortcut Discrimination
+
+Signal #5 (ShortcutLearning) currently detects variance anomalies, which are necessary but not sufficient for shortcut identification (see §12.2 note). **Effective rank** of the representation matrix (computed via singular value entropy) can distinguish shortcut learning (low rank, variance concentrated in few dimensions) from legitimate complex features (high rank, variance distributed). This is a Tier 2 metric requiring SVD computation, feasible at cadence intervals but not every step.
+
+### 15.8 Bootstrap Threshold Discovery
+
+For novel architectures with no prior training history, the bootstrap phase can run in **observation-only mode** (§4.7), collecting metric distributions without enforcement. Post-observation, the system proposes thresholds from empirical percentiles. This converts the bootstrap from a "settling period" into a structured discovery phase, reducing the threshold authorship burden for new architectures from "know the answer" to "review a proposal."
 
 ---
 

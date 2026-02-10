@@ -54,6 +54,9 @@ fn default_gradient_domination_ratio() -> f64 {
 fn default_overfit_min_divergence() -> f64 {
     0.05
 }
+fn default_shortcut_rank_threshold() -> f64 {
+    0.3
+}
 
 /// Configuration for the diagnostic layer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -139,6 +142,13 @@ pub struct DiagnosticConfig {
     /// Minimum relative divergence between train and val loss to trigger overfitting warning.
     #[serde(default = "default_overfit_min_divergence")]
     pub overfit_min_divergence: f64,
+
+    /// Rank threshold for shortcut discrimination. When `{component}.effective_rank`
+    /// drops below this fraction of its initial value while variance explodes,
+    /// confidence in shortcut learning is boosted. When rank is stable or growing,
+    /// the signal is suppressed. Default: 0.3 (rank below 30% of initial).
+    #[serde(default = "default_shortcut_rank_threshold")]
+    pub shortcut_rank_threshold: f64,
 }
 
 impl Default for DiagnosticConfig {
@@ -180,6 +190,7 @@ impl Default for DiagnosticConfig {
 
             gradient_domination_ratio: 100.0,
             overfit_min_divergence: 0.05,
+            shortcut_rank_threshold: 0.3,
         }
     }
 }
@@ -855,6 +866,7 @@ impl DiagnosticLayer {
         // Check for representation collapse while loss improves
         let mut collapsing_components = Vec::new();
         let mut evidence = Vec::new();
+        let mut rank_supported_components = 0usize;
 
         for component in &self.components {
             let cos_key = format!("{}.pairwise_cosine", component);
@@ -921,8 +933,47 @@ impl DiagnosticLayer {
                 }
             }
 
+            // Rank-based discrimination (§15.7): if {component}.effective_rank
+            // is reported, use it to distinguish shortcut amplification from
+            // legitimate complex feature learning. Zero-config: if the metric
+            // never appears, this block is a no-op.
+            let rank_key = format!("{}.effective_rank", component);
+            let first_rank = Self::mean_metric(first, &rank_key);
+            let second_rank = Self::mean_metric(second, &rank_key);
+            let mut has_rank_suppression = false;
+
+            if let (Some(fr), Some(sr)) = (first_rank, second_rank) {
+                if fr > 1e-10 {
+                    let rank_ratio = sr / fr;
+                    if rank_ratio < self.config.shortcut_rank_threshold {
+                        // Rank collapsed — strong shortcut indicator. Boost signal.
+                        if signals == 0 {
+                            signals = 1; // Trigger even without other indicators
+                        }
+                        evidence.push(format!(
+                            "Effective rank in {} dropped to {:.1}% of initial ({:.4} -> {:.4}). \
+                             Variance is concentrating in few dimensions, consistent with \
+                             shortcut feature amplification.",
+                            component,
+                            rank_ratio * 100.0,
+                            fr, sr,
+                        ));
+                    } else if rank_ratio >= 1.0 && signals > 0 {
+                        // Rank stable or growing — likely legitimate learning.
+                        // Suppress the shortcut signal for this component.
+                        signals = 0;
+                        has_rank_suppression = true;
+                        evidence.retain(|e| !e.contains(component.as_str()));
+                    }
+                }
+            }
+            let _ = has_rank_suppression; // used for confidence adjustment below
+
             if signals > 0 {
                 collapsing_components.push(component.clone());
+                if first_rank.is_some() && second_rank.is_some() {
+                    rank_supported_components += 1;
+                }
             }
         }
 
@@ -941,8 +992,11 @@ impl DiagnosticLayer {
                     .into(),
             );
 
+            // When rank data supports the signal, allow higher confidence (up to 0.9).
+            // Without rank data, cap at 0.5 — variance alone is ambiguous (§12.2 note).
+            let max_confidence = if rank_supported_components > 0 { 0.9 } else { 0.5 };
             let confidence = (collapsing_components.len() as f64 / self.components.len() as f64)
-                .min(0.9)
+                .min(max_confidence)
                 .max(0.3);
 
             out.push(DiagnosticWarning {
@@ -2920,5 +2974,183 @@ mod tests {
                 step,
             );
         }
+    }
+
+    // ===================================================================
+    // Rank-based shortcut discrimination (V1.5 / §15.7)
+    // ===================================================================
+
+    #[test]
+    fn shortcut_suppressed_when_rank_growing() {
+        let config = DiagnosticConfig {
+            warmup_steps: 10,
+            cadence: 1,
+            history_window: 50,
+            min_confidence: 0.1,
+            shortcut_variance_explosion: 0.5, // 50% increase triggers
+            ..Default::default()
+        };
+        let mut diag = DiagnosticLayer::new(
+            config,
+            vec!["backbone".into(), "head".into()],
+        );
+
+        // Loss improving + variance exploding, but rank is GROWING — legitimate learning
+        for step in 0..80 {
+            let mut metrics = healthy_metrics();
+            let t = step as f64 / 80.0;
+            metrics.insert("loss".into(), 3.0 - t * 2.5);
+            metrics.insert("backbone.pairwise_cosine".into(), 0.5 - t * 0.1);
+            metrics.insert("backbone.activation_variance".into(), 0.1 * (1.0 + t * 3.0));
+            // Rank growing — complex distributed features, not a shortcut
+            metrics.insert("backbone.effective_rank".into(), 50.0 + t * 30.0);
+            metrics.insert("head.pairwise_cosine".into(), 0.4);
+            metrics.insert("head.activation_variance".into(), 0.08);
+
+            let warnings = diag.diagnose(step, &metrics);
+            assert!(
+                warnings.iter().all(|w| w.signal != DiagnosticSignal::ShortcutLearning),
+                "Step {}: shortcut learning should be suppressed when rank is growing",
+                step,
+            );
+        }
+    }
+
+    #[test]
+    fn shortcut_boosted_when_rank_drops() {
+        let config = DiagnosticConfig {
+            warmup_steps: 10,
+            cadence: 1,
+            history_window: 50,
+            min_confidence: 0.1,
+            shortcut_variance_explosion: 0.5,
+            shortcut_rank_threshold: 0.3,
+            ..Default::default()
+        };
+        let mut diag = DiagnosticLayer::new(
+            config,
+            vec!["backbone".into(), "head".into()],
+        );
+
+        // Loss improving + variance exploding + rank COLLAPSING — strong shortcut signal.
+        // Rank drops sharply at step 10 (step function) so the first/second half ratio
+        // is well below 0.3 by the time the variance explosion triggers (~step 40).
+        let mut fired = false;
+        for step in 0..80 {
+            let mut metrics = healthy_metrics();
+            let t = step as f64 / 80.0;
+            metrics.insert("loss".into(), 3.0 - t * 2.5);
+            metrics.insert("backbone.pairwise_cosine".into(), 0.5 - t * 0.1);
+            metrics.insert("backbone.activation_variance".into(), 0.1 * (1.0 + t * 3.0));
+            // Sharp rank collapse — from 50 to 2 at step 10
+            let rank = if step < 10 { 50.0 } else { 2.0 };
+            metrics.insert("backbone.effective_rank".into(), rank);
+            metrics.insert("head.pairwise_cosine".into(), 0.4);
+            metrics.insert("head.activation_variance".into(), 0.08);
+
+            let warnings = diag.diagnose(step, &metrics);
+            if let Some(w) = warnings.iter().find(|w| w.signal == DiagnosticSignal::ShortcutLearning) {
+                fired = true;
+                assert!(
+                    w.evidence.iter().any(|e| e.contains("Effective rank")),
+                    "Warning should mention effective rank: {:?}", w.evidence,
+                );
+                break;
+            }
+        }
+        assert!(fired, "Expected shortcut learning warning when rank is collapsing");
+    }
+
+    #[test]
+    fn shortcut_unchanged_without_rank_data() {
+        // Without effective_rank metric, behavior should be identical to existing
+        let config = DiagnosticConfig {
+            warmup_steps: 10,
+            cadence: 1,
+            history_window: 50,
+            min_confidence: 0.1,
+            shortcut_variance_explosion: 0.5,
+            ..Default::default()
+        };
+        let mut diag = DiagnosticLayer::new(
+            config,
+            vec!["backbone".into(), "head".into()],
+        );
+
+        let mut fired = false;
+        for step in 0..80 {
+            let mut metrics = healthy_metrics();
+            let t = step as f64 / 80.0;
+            metrics.insert("loss".into(), 3.0 - t * 2.5);
+            metrics.insert("backbone.pairwise_cosine".into(), 0.5 - t * 0.1);
+            metrics.insert("backbone.activation_variance".into(), 0.1 * (1.0 + t * 3.0));
+            // No effective_rank metric — behavior unchanged
+            metrics.insert("head.pairwise_cosine".into(), 0.4);
+            metrics.insert("head.activation_variance".into(), 0.08);
+
+            let warnings = diag.diagnose(step, &metrics);
+            if let Some(w) = warnings.iter().find(|w| w.signal == DiagnosticSignal::ShortcutLearning) {
+                fired = true;
+                // Without rank data, confidence should be capped at 0.5
+                assert!(
+                    w.confidence <= 0.5,
+                    "Without rank data, confidence should be <= 0.5, got {}",
+                    w.confidence,
+                );
+                assert!(
+                    w.evidence.iter().all(|e| !e.contains("Effective rank")),
+                    "Should not mention effective rank without rank data",
+                );
+                break;
+            }
+        }
+        assert!(fired, "Expected shortcut learning warning from variance explosion");
+    }
+
+    #[test]
+    fn shortcut_rank_threshold_configurable() {
+        // With threshold at 0.5, a rank at ~44% of initial (ratio 0.44) should trigger.
+        // At default threshold 0.3, this ratio wouldn't trigger the rank boost.
+        let config = DiagnosticConfig {
+            warmup_steps: 10,
+            cadence: 1,
+            history_window: 50,
+            min_confidence: 0.1,
+            shortcut_variance_explosion: 0.5,
+            shortcut_rank_threshold: 0.5, // higher threshold = easier to trigger
+            ..Default::default()
+        };
+        let mut diag = DiagnosticLayer::new(
+            config,
+            vec!["backbone".into(), "head".into()],
+        );
+
+        let mut fired = false;
+        for step in 0..80 {
+            let mut metrics = healthy_metrics();
+            let t = step as f64 / 80.0;
+            metrics.insert("loss".into(), 3.0 - t * 2.5);
+            metrics.insert("backbone.pairwise_cosine".into(), 0.5 - t * 0.1);
+            metrics.insert("backbone.activation_variance".into(), 0.1 * (1.0 + t * 3.0));
+            // Moderate rank drop — from 50 to 14 at step 10. By the time the variance
+            // explosion triggers (~step 40), the half-window ratio is ~0.44.
+            // Above 0.3 (default) but below 0.5 (custom).
+            let rank = if step < 10 { 50.0 } else { 14.0 };
+            metrics.insert("backbone.effective_rank".into(), rank);
+            metrics.insert("head.pairwise_cosine".into(), 0.4);
+            metrics.insert("head.activation_variance".into(), 0.08);
+
+            let warnings = diag.diagnose(step, &metrics);
+            if let Some(w) = warnings.iter().find(|w| w.signal == DiagnosticSignal::ShortcutLearning) {
+                fired = true;
+                assert!(
+                    w.evidence.iter().any(|e| e.contains("Effective rank")),
+                    "Should mention effective rank with custom threshold: {:?}",
+                    w.evidence,
+                );
+                break;
+            }
+        }
+        assert!(fired, "Expected shortcut learning warning with custom rank threshold 0.5");
     }
 }

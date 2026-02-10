@@ -2,10 +2,12 @@
 name = "transxform"
 version = "0.1.0"
 edition = "2021"
-description = "Boundary-governed transformer training supervisor"
+rust-version = "1.70"
+description = "Boundary-governed transformer training supervisor — spec-driven invariant enforcement, phase-gated governance, and advisory diagnostics for deep learning training loops"
 license = "MIT OR Apache-2.0"
 keywords = ["machine-learning", "transformer", "training", "supervisor", "invariant"]
 categories = ["science", "development-tools"]
+readme = "TransXform_Whitepaper.md"
 
 [features]
 default = []

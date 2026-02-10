@@ -304,10 +304,18 @@ impl ControlLaws {
                 factor: self.config.damping_factor,
             }
         } else if name.contains("drift") {
-            // Representation drift: rescale
+            // Representation drift: rescale weights toward threshold.
+            // ratio < 1.0 for Max violations (too high), > 1.0 for Min (too low).
+            // Dampened by damping_factor so corrections are gentle.
+            let ratio = if violation.observed.abs() > 1e-12 {
+                violation.threshold / violation.observed
+            } else {
+                self.config.damping_factor
+            };
+            let factor = 1.0 + self.config.damping_factor * (ratio - 1.0);
             Action::Rescale {
                 component,
-                factor: 1.0, // rescale to baseline (implementation would compute actual factor)
+                factor,
             }
         } else {
             // Default soft action: dampen LR
@@ -337,6 +345,8 @@ mod tests {
             readiness_gate: true,
             readiness_patience_steps: 200,
             max_threshold_relaxation: 0.02,
+            discovery_mode: false,
+            shadow_step: false,
         }
     }
 
@@ -546,6 +556,57 @@ mod tests {
                 assert_eq!(component, "backbone", "Should trace through to degenerate grandparent");
             }
             other => panic!("Expected Reinitialize(backbone), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn soft_drift_rescale_factor_not_one() {
+        let laws = ControlLaws::new(&test_config());
+        let v = Violation {
+            invariant_name: "representation_drift".into(),
+            component: "backbone".into(),
+            severity: Severity::Soft,
+            observed: 0.8, // drifted to 0.8
+            threshold: 0.5, // should be below 0.5
+            direction: ThresholdDirection::Max,
+            step: 100,
+            passive: false,
+        };
+        let action = laws.soft_action(&v, Phase::Stabilization, None);
+        match action {
+            Some(Action::Rescale { factor, .. }) => {
+                // ratio = 0.5/0.8 = 0.625, factor = 1 + 0.5*(0.625-1) = 0.8125
+                assert!(
+                    (factor - 0.8125).abs() < 1e-6,
+                    "Expected rescale factor ~0.8125, got {}",
+                    factor,
+                );
+                assert!(factor < 1.0, "Max violation should scale DOWN");
+            }
+            other => panic!("Expected Rescale, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn soft_drift_rescale_min_direction() {
+        let laws = ControlLaws::new(&test_config());
+        let v = Violation {
+            invariant_name: "variance_drift".into(),
+            component: "head".into(),
+            severity: Severity::Soft,
+            observed: 0.001,  // too low
+            threshold: 0.01,  // should be above 0.01
+            direction: ThresholdDirection::Min,
+            step: 100,
+            passive: false,
+        };
+        let action = laws.soft_action(&v, Phase::Stabilization, None);
+        match action {
+            Some(Action::Rescale { factor, .. }) => {
+                // ratio = 0.01/0.001 = 10.0, factor = 1 + 0.5*(10-1) = 5.5
+                assert!(factor > 1.0, "Min violation should scale UP, got {}", factor);
+            }
+            other => panic!("Expected Rescale, got {:?}", other),
         }
     }
 

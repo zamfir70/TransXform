@@ -364,6 +364,8 @@ control: {}
             readiness_gate: true,
             readiness_patience_steps: 200,
             max_threshold_relaxation: 0.02,
+            discovery_mode: false,
+            shadow_step: false,
         }
     }
 
